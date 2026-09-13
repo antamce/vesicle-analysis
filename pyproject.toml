@@ -1,0 +1,12 @@
+[project]
+name = "vesicle-analysis"
+version = "0.1.0"
+description = "Desktop analysis of synaptic-vesicle-pool ND2 recordings"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -p no:cacheprovider"
+filterwarnings = [
+    "ignore:Setting the shape on a NumPy array has been deprecated:DeprecationWarning:nd2\\._nd2file",
+]

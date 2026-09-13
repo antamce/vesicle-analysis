@@ -1,0 +1,16 @@
+name: vesicle-analysis
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - scikit-image
+  - pandas
+  - openpyxl
+  - pyside6
+  - pyqtgraph
+  - nd2
+  - roifile
+  - pytest
+  - pytest-qt

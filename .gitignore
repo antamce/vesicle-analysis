@@ -1,0 +1,26 @@
+# Large source microscopy recordings
+*.nd2
+*.zip
+
+# Private local project notes
+.agents/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Analysis outputs and temporary files
+outputs/
+*.tmp
+~$*.xlsx
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
