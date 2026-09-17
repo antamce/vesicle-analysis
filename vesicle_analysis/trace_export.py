@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,18 @@ from skimage.measure import find_contours
 
 from vesicle_analysis import __version__
 from vesicle_analysis.analysis import PeakDetectionResult, RectangleBounds
+from vesicle_analysis.area_analysis import AreaAnalysisResult, area_qc_text
 from vesicle_analysis.background import BackgroundParameters
+from vesicle_analysis.motion_correction import (
+    MotionCorrectionResult,
+    apply_frame_transform,
+)
 from vesicle_analysis.nd2_io import RecordingMetadata
 from vesicle_analysis.segmentation import SegmentationParameters
+from vesicle_analysis.trace_review import (
+    NormalizedTraceResult,
+    normalize_pool_traces,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,8 +60,12 @@ class AnalysisExportRequest:
     background_labels: NDArray[np.int32]
     automatic_background_labels: NDArray[np.int32]
     background_assignments: dict[int, int | None]
+    area_result: AreaAnalysisResult
     display_lut: NDArray[np.uint8]
     display_levels: tuple[float, float]
+    included_pool_ids: tuple[int, ...] | None = None
+    exclusion_reasons: dict[int, str] = field(default_factory=dict)
+    motion_correction: MotionCorrectionResult | None = None
     uniform_interval_s: float | None = None
     overwrite: bool = False
 
@@ -61,6 +75,7 @@ class AnalysisExportResult:
     workbook_path: Path
     roi_zip_path: Path
     lut_path: Path
+    manifest_path: Path
     frame_count: int
     pool_count: int
     background_count: int
@@ -74,6 +89,7 @@ def extract_recording_traces(
     *,
     timestamps_s: tuple[float, ...] | None = None,
     uniform_interval_s: float | None = None,
+    motion_correction: MotionCorrectionResult | None = None,
 ) -> TraceExtractionResult:
     """Stream one ND2 and calculate raw means for every fixed labelled mask."""
     path = Path(path).expanduser().resolve()
@@ -121,6 +137,17 @@ def extract_recording_traces(
                 raise ValueError(
                     f"Frame {frame_index + 1} has unexpected shape {frame.shape}."
                 )
+            if motion_correction is not None:
+                if (
+                    motion_correction.image_shape != frame.shape
+                    or len(motion_correction.transforms) != frame_count
+                ):
+                    raise ValueError(
+                        "Motion correction does not match the ND2 recording."
+                    )
+                frame = apply_frame_transform(
+                    frame, motion_correction.transforms[frame_index]
+                )
             flat_frame = frame.ravel()
             pool_traces[frame_index] = _label_means(
                 flat_frame, flat_pool_labels, pool_ids, pool_counts
@@ -154,16 +181,21 @@ def export_analysis_bundle(request: AnalysisExportRequest) -> AnalysisExportResu
     workbook_path = output_directory / f"{request.source_path.stem}_analysis.xlsx"
     roi_zip_path = output_directory / f"{request.source_path.stem}_rois.zip"
     lut_path = output_directory / f"{request.source_path.stem}_display.lut"
-    for path in (workbook_path, roi_zip_path, lut_path):
+    manifest_path = output_directory / f"{request.source_path.stem}_manifest.json"
+    final_paths = (workbook_path, roi_zip_path, lut_path, manifest_path)
+    for path in final_paths:
         if path.exists() and not request.overwrite:
             raise FileExistsError(path)
 
+    export_pool_labels, export_background_labels = _filtered_export_labels(request)
+
     traces = extract_recording_traces(
         request.source_path,
-        request.pool_labels,
-        request.background_labels,
+        export_pool_labels,
+        export_background_labels,
         timestamps_s=request.metadata.timestamps_s,
         uniform_interval_s=request.uniform_interval_s,
+        motion_correction=request.motion_correction,
     )
     staging_directory = (
         output_directory / f".{request.source_path.stem}-export-{uuid4().hex}"
@@ -172,6 +204,7 @@ def export_analysis_bundle(request: AnalysisExportRequest) -> AnalysisExportResu
     staged_workbook = staging_directory / workbook_path.name
     staged_rois = staging_directory / roi_zip_path.name
     staged_lut = staging_directory / lut_path.name
+    staged_manifest = staging_directory / manifest_path.name
     try:
         staging_request = replace(
             request, output_directory=staging_directory, overwrite=True
@@ -179,33 +212,137 @@ def export_analysis_bundle(request: AnalysisExportRequest) -> AnalysisExportResu
         write_analysis_workbook(staged_workbook, traces, staging_request)
         write_imagej_roi_zip(
             staged_rois,
-            request.pool_labels,
-            request.background_labels,
+            export_pool_labels,
+            export_background_labels,
             request.rectangles,
             effective_peak_index=request.effective_peak_index,
             overwrite=True,
         )
         write_imagej_lut(staged_lut, request.display_lut, overwrite=True)
-        for path in (workbook_path, roi_zip_path, lut_path):
+        write_analysis_manifest(
+            staged_manifest,
+            request,
+            traces,
+            overwrite=True,
+        )
+        for path in final_paths:
             if path.exists() and not request.overwrite:
                 raise FileExistsError(path)
         os.replace(staged_workbook, workbook_path)
         os.replace(staged_rois, roi_zip_path)
         os.replace(staged_lut, lut_path)
+        os.replace(staged_manifest, manifest_path)
     finally:
         staged_workbook.unlink(missing_ok=True)
         staged_rois.unlink(missing_ok=True)
         staged_lut.unlink(missing_ok=True)
+        staged_manifest.unlink(missing_ok=True)
         staging_directory.rmdir()
     return AnalysisExportResult(
         workbook_path=workbook_path,
         roi_zip_path=roi_zip_path,
         lut_path=lut_path,
+        manifest_path=manifest_path,
         frame_count=len(traces.frame_numbers),
         pool_count=len(traces.pool_ids),
         background_count=len(traces.background_ids),
         time_source=traces.time_source,
     )
+
+
+def _accepted_pool_ids(request: AnalysisExportRequest) -> tuple[int, ...]:
+    existing = tuple(
+        int(value) for value in np.unique(request.pool_labels) if value > 0
+    )
+    included = (
+        existing if request.included_pool_ids is None else request.included_pool_ids
+    )
+    if not included:
+        raise ValueError("At least one pool must remain included for export.")
+    if len(set(included)) != len(included) or not set(included).issubset(existing):
+        raise ValueError("Included pool identifiers do not match the accepted masks.")
+    if not set(request.exclusion_reasons).issubset(existing):
+        raise ValueError("Exclusion reasons contain an unknown pool identifier.")
+    return tuple(pool_id for pool_id in existing if pool_id in set(included))
+
+
+def _filtered_export_labels(
+    request: AnalysisExportRequest,
+) -> tuple[NDArray[np.int32], NDArray[np.int32]]:
+    included = _accepted_pool_ids(request)
+    pool_labels = np.where(
+        np.isin(request.pool_labels, included), request.pool_labels, 0
+    ).astype(np.int32, copy=False)
+    if request.background_parameters.mode == "common":
+        background_labels = np.asarray(request.background_labels, dtype=np.int32).copy()
+    else:
+        background_ids = tuple(
+            background_id
+            for background_id, owner in request.background_assignments.items()
+            if owner in included
+        )
+        background_labels = np.where(
+            np.isin(request.background_labels, background_ids),
+            request.background_labels,
+            0,
+        ).astype(np.int32, copy=False)
+    if not np.any(background_labels):
+        raise ValueError("No background remains for the included pools.")
+    return pool_labels, background_labels
+
+
+def write_analysis_manifest(
+    path: Path,
+    request: AnalysisExportRequest,
+    traces: TraceExtractionResult,
+    *,
+    overwrite: bool = False,
+) -> None:
+    path = Path(path).expanduser().resolve()
+    if path.exists() and not overwrite:
+        raise FileExistsError(path)
+    all_pool_ids = tuple(
+        int(value) for value in np.unique(request.pool_labels) if value > 0
+    )
+    included = _accepted_pool_ids(request)
+    payload = {
+        "format": "vesicle-analysis-export-manifest",
+        "version": 1,
+        "source_path": str(request.source_path),
+        "source_filename": request.source_path.name,
+        "source_file_size_bytes": request.metadata.file_size_bytes,
+        "included_pool_ids": included,
+        "excluded_pools": [
+            {
+                "pool_id": pool_id,
+                "reason": request.exclusion_reasons.get(pool_id, ""),
+            }
+            for pool_id in all_pool_ids
+            if pool_id not in included
+        ],
+        "exported_background_ids": traces.background_ids,
+        "normalization": (
+            "(pool - assigned background) / mean(pool - assigned background, "
+            "frames 1-10)"
+        ),
+        "raw_traces_preserved": True,
+        "outputs": {
+            "workbook": f"{request.source_path.stem}_analysis.xlsx",
+            "roi_zip": f"{request.source_path.stem}_rois.zip",
+            "display_lut": f"{request.source_path.stem}_display.lut",
+        },
+    }
+    temporary = _temporary_sibling(path, ".json")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        verification = json.loads(temporary.read_text(encoding="utf-8"))
+        if verification.get("format") != payload["format"]:
+            raise RuntimeError("Analysis manifest verification failed.")
+        if path.exists() and not overwrite:
+            raise FileExistsError(path)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_imagej_lut(
@@ -246,6 +383,14 @@ def write_analysis_workbook(
     path = Path(path).expanduser().resolve()
     if path.exists() and not request.overwrite:
         raise FileExistsError(path)
+    normalized = normalize_pool_traces(
+        traces.pool_ids,
+        traces.pool_traces,
+        traces.background_ids,
+        traces.background_traces,
+        background_mode=request.background_parameters.mode,
+        background_assignments=request.background_assignments,
+    )
     workbook = Workbook()
     metadata_sheet = workbook.active
     metadata_sheet.title = "Metadata"
@@ -258,6 +403,9 @@ def write_analysis_workbook(
         traces.pool_traces,
         "Pool",
     )
+    _write_normalized_trace_sheet(
+        workbook.create_sheet("Normalized traces"), traces, normalized
+    )
     _write_trace_sheet(
         workbook.create_sheet("Background traces"),
         traces.frame_numbers,
@@ -266,6 +414,10 @@ def write_analysis_workbook(
         traces.background_traces,
         "BG",
     )
+    _write_pool_summary_sheet(
+        workbook.create_sheet("Pool summary"), request, normalized
+    )
+    _write_pool_areas_sheet(workbook.create_sheet("Pool areas"), traces, request)
     _write_regions_sheet(workbook.create_sheet("Regions"), request)
     _write_recording_mean_sheet(
         workbook.create_sheet("Recording mean"), traces, request.peak_result
@@ -279,7 +431,10 @@ def write_analysis_workbook(
             expected_sheets = [
                 "Metadata",
                 "Pool traces",
+                "Normalized traces",
                 "Background traces",
+                "Pool summary",
+                "Pool areas",
                 "Regions",
                 "Recording mean",
             ]
@@ -289,6 +444,15 @@ def write_analysis_workbook(
                 raise RuntimeError(
                     "Workbook verification found incomplete pool traces."
                 )
+            if (
+                verification["Normalized traces"].max_row
+                != len(traces.frame_numbers) + 1
+            ):
+                raise RuntimeError(
+                    "Workbook verification found incomplete normalized traces."
+                )
+            if verification["Pool areas"].max_row != len(traces.frame_numbers) + 1:
+                raise RuntimeError("Workbook verification found incomplete pool areas.")
         finally:
             verification.close()
         if path.exists() and not request.overwrite:
@@ -442,13 +606,37 @@ def _write_metadata_sheet(
         ("Automatic peak frame", request.peak_result.automatic_peak_index + 1),
         ("Effective peak frame", request.effective_peak_index + 1),
         ("Analysis rectangle count", len(request.rectangles)),
-        ("Accepted pool count", len(traces.pool_ids)),
+        (
+            "Accepted pool count",
+            len(tuple(value for value in np.unique(request.pool_labels) if value > 0)),
+        ),
+        ("Included pool count", len(traces.pool_ids)),
+        (
+            "Excluded pool count",
+            len(tuple(value for value in np.unique(request.pool_labels) if value > 0))
+            - len(traces.pool_ids),
+        ),
         ("Accepted background count", len(traces.background_ids)),
         ("Background mode", request.background_parameters.mode),
         ("Display LUT file", f"{request.source_path.stem}_display.lut"),
         ("Display minimum", request.display_levels[0]),
         ("Display maximum", request.display_levels[1]),
         ("Display note", "Display-only; analysis used raw ND2 pixel values"),
+        (
+            "Motion correction",
+            "none"
+            if request.motion_correction is None
+            else request.motion_correction.mode,
+        ),
+        ("Area peak frame", request.area_result.peak_frame_index + 1),
+        ("Area search margin [px]", 0),
+        ("Area threshold", "Recalculated from local noise in every frame"),
+        ("Area identity mask", "Accepted peak-frame pool boundary"),
+        (
+            "Normalized trace formula",
+            "(pool - assigned background) / mean(pool - assigned background, frames 1-10)",
+        ),
+        ("Raw trace note", "Raw pool and background traces are preserved unchanged"),
     ]
     for name, value in asdict(request.segmentation_parameters).items():
         rows.append((f"Segmentation: {name}", value))
@@ -482,7 +670,162 @@ def _write_trace_sheet(
     _format_table_sheet(sheet)
 
 
+def _write_normalized_trace_sheet(
+    sheet: Any,
+    traces: TraceExtractionResult,
+    normalized: NormalizedTraceResult,
+) -> None:
+    headers = ["Frame"]
+    if traces.time_s is not None:
+        headers.append("Time [s]")
+    headers.extend(f"Pool {pool_id}" for pool_id in normalized.pool_ids)
+    sheet.append(headers)
+    for frame_index, frame_number in enumerate(traces.frame_numbers):
+        row: list[int | float | None] = [int(frame_number)]
+        if traces.time_s is not None:
+            row.append(float(traces.time_s[frame_index]))
+        row.extend(
+            (
+                float(normalized.values[frame_index, column])
+                if normalized.available[column]
+                else None
+            )
+            for column in range(len(normalized.pool_ids))
+        )
+        sheet.append(row)
+    _format_table_sheet(sheet)
+
+
+def _validate_area_result(
+    traces: TraceExtractionResult, request: AnalysisExportRequest
+) -> AreaAnalysisResult:
+    result = request.area_result
+    if not set(traces.pool_ids).issubset(result.pool_ids):
+        raise ValueError("Area results do not contain every included pool identifier.")
+    if not np.array_equal(result.frame_numbers, traces.frame_numbers):
+        raise ValueError("Area results do not match the recording frames.")
+    counts = np.bincount(request.pool_labels.ravel())
+    expected_peak = np.asarray(
+        [counts[pool_id] for pool_id in result.pool_ids], dtype=np.int32
+    )
+    if not np.array_equal(result.peak_areas_px, expected_peak):
+        raise ValueError("Area results do not match the accepted peak-frame masks.")
+    return result
+
+
+def _write_pool_summary_sheet(
+    sheet: Any,
+    request: AnalysisExportRequest,
+    normalized: NormalizedTraceResult,
+) -> None:
+    result = request.area_result
+    included = set(_accepted_pool_ids(request))
+    normalized_columns = {
+        pool_id: column for column, pool_id in enumerate(normalized.pool_ids)
+    }
+    pixel_area_um2 = request.metadata.pixel_size_x_um * request.metadata.pixel_size_y_um
+    headers = (
+        "Pool ID",
+        "Included in export",
+        "Exclusion reason",
+        "Peak frame",
+        "Peak area [px^2]",
+        "Peak area [um^2]",
+        "Centroid X [px]",
+        "Centroid Y [px]",
+        "Analysis rectangle",
+        "Origin",
+        "Detected frames",
+        "Not-detected frames",
+        "Frames with QC warnings",
+        "Normalized trace available",
+        "Normalization baseline",
+    )
+    sheet.append(headers)
+    for column, pool_id in enumerate(result.pool_ids):
+        yy, xx = np.nonzero(request.pool_labels == pool_id)
+        rectangle_index = _owning_rectangle_index(xx, yy, request.rectangles)
+        unchanged = (
+            request.automatic_pool_labels.shape == request.pool_labels.shape
+            and np.array_equal(
+                request.pool_labels == pool_id,
+                request.automatic_pool_labels == pool_id,
+            )
+        )
+        areas = result.areas_px[:, column]
+        qc = result.qc_codes[:, column]
+        peak_area = int(result.peak_areas_px[column])
+        normalized_column = normalized_columns.get(pool_id)
+        normalization_available = (
+            bool(normalized.available[normalized_column])
+            if normalized_column is not None
+            else None
+        )
+        normalization_baseline = (
+            float(normalized.baselines[normalized_column])
+            if normalized_column is not None
+            else None
+        )
+        sheet.append(
+            (
+                pool_id,
+                pool_id in included,
+                request.exclusion_reasons.get(pool_id, ""),
+                result.peak_frame_index + 1,
+                peak_area,
+                peak_area * pixel_area_um2,
+                float(np.mean(xx)),
+                float(np.mean(yy)),
+                rectangle_index,
+                "automatic" if unchanged else "manual/edited",
+                int(np.count_nonzero(areas)),
+                int(np.count_nonzero(areas == 0)),
+                int(np.count_nonzero(qc)),
+                normalization_available,
+                normalization_baseline,
+            )
+        )
+    _format_table_sheet(sheet)
+
+
+def _write_pool_areas_sheet(
+    sheet: Any, traces: TraceExtractionResult, request: AnalysisExportRequest
+) -> None:
+    result = _validate_area_result(traces, request)
+    pixel_area_um2 = request.metadata.pixel_size_x_um * request.metadata.pixel_size_y_um
+    headers = ["Frame"]
+    if traces.time_s is not None:
+        headers.append("Time [s]")
+    result_columns = {pool_id: index for index, pool_id in enumerate(result.pool_ids)}
+    for pool_id in traces.pool_ids:
+        headers.extend(
+            (
+                f"Pool {pool_id} area [px^2]",
+                f"Pool {pool_id} area [um^2]",
+                f"Pool {pool_id} QC",
+            )
+        )
+    sheet.append(headers)
+    for frame_index, frame_number in enumerate(result.frame_numbers):
+        row: list[int | float | str] = [int(frame_number)]
+        if traces.time_s is not None:
+            row.append(float(traces.time_s[frame_index]))
+        for pool_id in traces.pool_ids:
+            pool_column = result_columns[pool_id]
+            area_px = int(result.areas_px[frame_index, pool_column])
+            row.extend(
+                (
+                    area_px,
+                    area_px * pixel_area_um2,
+                    area_qc_text(int(result.qc_codes[frame_index, pool_column])),
+                )
+            )
+        sheet.append(row)
+    _format_table_sheet(sheet)
+
+
 def _write_regions_sheet(sheet: Any, request: AnalysisExportRequest) -> None:
+    pool_labels, background_labels = _filtered_export_labels(request)
     headers = (
         "Region",
         "Type",
@@ -501,7 +844,7 @@ def _write_regions_sheet(sheet: Any, request: AnalysisExportRequest) -> None:
     sheet.append(headers)
     for row in _region_rows(
         "Pool",
-        request.pool_labels,
+        pool_labels,
         request.automatic_pool_labels,
         request.rectangles,
         {},
@@ -509,7 +852,7 @@ def _write_regions_sheet(sheet: Any, request: AnalysisExportRequest) -> None:
         sheet.append(row)
     for row in _region_rows(
         "Background",
-        request.background_labels,
+        background_labels,
         request.automatic_background_labels,
         request.rectangles,
         request.background_assignments,

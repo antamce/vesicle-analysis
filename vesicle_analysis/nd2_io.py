@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import nd2
 import numpy as np
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from vesicle_analysis.motion_correction import MotionCorrectionResult
 
 
 class UnsupportedRecordingError(ValueError):
@@ -79,7 +83,11 @@ def read_metadata(path: Path) -> RecordingMetadata:
         )
 
 
-def read_frame(path: Path, index: int) -> NDArray[np.generic]:
+def read_frame(
+    path: Path,
+    index: int,
+    correction: MotionCorrectionResult | None = None,
+) -> NDArray[np.generic]:
     path = _validated_path(path)
     with nd2.ND2File(path) as recording:
         sizes = dict(recording.sizes)
@@ -95,6 +103,16 @@ def read_frame(path: Path, index: int) -> NDArray[np.generic]:
         raise UnsupportedRecordingError(
             f"Expected a 2D frame, received shape {frame.shape!r}."
         )
+    if correction is not None:
+        if correction.image_shape != frame.shape:
+            raise ValueError("Motion correction dimensions do not match the ND2 frame.")
+        if len(correction.transforms) != sizes["T"]:
+            raise ValueError(
+                "Motion correction frame count does not match the ND2 file."
+            )
+        from vesicle_analysis.motion_correction import apply_frame_transform
+
+        frame = apply_frame_transform(frame, correction.transforms[index])
     return frame
 
 

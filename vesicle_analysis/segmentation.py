@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -13,6 +14,9 @@ from skimage.segmentation import watershed
 
 from vesicle_analysis.analysis import RectangleBounds
 from vesicle_analysis.nd2_io import read_frame
+
+if TYPE_CHECKING:
+    from vesicle_analysis.motion_correction import MotionCorrectionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,8 +69,9 @@ def segment_recording(
     peak_frame_index: int,
     rectangles: tuple[RectangleBounds, ...],
     parameters: SegmentationParameters,
+    correction: MotionCorrectionResult | None = None,
 ) -> SegmentationResult:
-    frame = read_frame(path, peak_frame_index)
+    frame = read_frame(path, peak_frame_index, correction)
     return segment_frame(frame, peak_frame_index, rectangles, parameters)
 
 

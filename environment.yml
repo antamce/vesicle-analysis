@@ -11,6 +11,7 @@ dependencies:
   - pyside6
   - pyqtgraph
   - nd2
+  - tifffile
   - roifile
   - pytest
   - pytest-qt

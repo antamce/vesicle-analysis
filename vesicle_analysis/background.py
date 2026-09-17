@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -9,6 +10,9 @@ from scipy import ndimage
 
 from vesicle_analysis.analysis import RectangleBounds
 from vesicle_analysis.nd2_io import read_frame
+
+if TYPE_CHECKING:
+    from vesicle_analysis.motion_correction import MotionCorrectionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +64,9 @@ def find_recording_backgrounds(
     pool_labels: NDArray[np.int32],
     rectangles: tuple[RectangleBounds, ...],
     parameters: BackgroundParameters,
+    correction: MotionCorrectionResult | None = None,
 ) -> BackgroundResult:
-    frame = read_frame(path, peak_frame_index)
+    frame = read_frame(path, peak_frame_index, correction)
     return find_backgrounds(
         frame,
         pool_labels,

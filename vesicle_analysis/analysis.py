@@ -3,12 +3,16 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import nd2
 import numpy as np
 from numpy.typing import NDArray
 
 from vesicle_analysis.nd2_io import _validate_dimensions, _validated_path
+
+if TYPE_CHECKING:
+    from vesicle_analysis.motion_correction import MotionCorrectionResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +85,9 @@ def overlaps_any(
 
 
 def detect_recording_peak(
-    path: Path, rectangles: Iterable[RectangleBounds]
+    path: Path,
+    rectangles: Iterable[RectangleBounds],
+    correction: MotionCorrectionResult | None = None,
 ) -> PeakDetectionResult:
     """Return the strict raw mean-intensity maximum over a rectangle union."""
     path = _validated_path(path)
@@ -112,7 +118,18 @@ def detect_recording_peak(
 
         means = np.empty(frame_count, dtype=np.float64)
         for frame_index in range(frame_count):
-            frame = recording.read_frame(frame_index)
+            frame = np.asarray(recording.read_frame(frame_index))
+            if correction is not None:
+                if (
+                    correction.image_shape != frame.shape
+                    or len(correction.transforms) != frame_count
+                ):
+                    raise ValueError(
+                        "Motion correction does not match the ND2 recording."
+                    )
+                from vesicle_analysis.motion_correction import apply_frame_transform
+
+                frame = apply_frame_transform(frame, correction.transforms[frame_index])
             crop = frame[min_y:max_y, min_x:max_x]
             means[frame_index] = np.sum(crop, where=union, dtype=np.float64)
         means /= pixel_count

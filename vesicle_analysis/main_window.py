@@ -30,14 +30,18 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -60,6 +64,13 @@ from vesicle_analysis.analysis import (
     detect_recording_peak,
     overlaps_any,
 )
+from vesicle_analysis.area_analysis import (
+    AreaAnalysisResult,
+    FrameAreaDetection,
+    analyze_recording_areas,
+    area_masks_to_rgba,
+    detect_frame_pool_areas,
+)
 from vesicle_analysis.background import (
     BackgroundParameters,
     BackgroundResult,
@@ -79,6 +90,15 @@ from vesicle_analysis.corrections import (
     polygon_mask,
     split_pool_with_line,
 )
+from vesicle_analysis.motion_correction import (
+    CorrectedRecordingExportResult,
+    FrameTransform,
+    MotionCorrectionResult,
+    apply_frame_transform,
+    estimate_motion_correction,
+    export_corrected_recording,
+    replace_frame_transform,
+)
 from vesicle_analysis.nd2_io import (
     RecordingMetadata,
     discover_nd2_files,
@@ -94,7 +114,15 @@ from vesicle_analysis.segmentation import (
 from vesicle_analysis.trace_export import (
     AnalysisExportRequest,
     AnalysisExportResult,
+    TraceExtractionResult,
     export_analysis_bundle,
+    extract_recording_traces,
+)
+from vesicle_analysis.trace_review import (
+    TraceReviewDecision,
+    normalize_pool_traces,
+    read_review_manifest,
+    write_review_manifest,
 )
 
 pg.setConfigOptions(imageAxisOrder="row-major", useOpenGL=False)
@@ -118,6 +146,10 @@ def application_icon_path() -> Path | None:
 
 @dataclass(slots=True)
 class RecordingAnalysisState:
+    motion_mode: str | None = None
+    motion_result: MotionCorrectionResult | None = None
+    motion_accepted: bool = False
+    motion_error: str | None = None
     rectangles: list[RectangleBounds] = field(default_factory=list)
     peak_result: PeakDetectionResult | None = None
     peak_error: str | None = None
@@ -130,6 +162,8 @@ class RecordingAnalysisState:
     correction_undo: list[MaskEdit] = field(default_factory=list)
     correction_redo: list[MaskEdit] = field(default_factory=list)
     selected_pool_ids: set[int] = field(default_factory=set)
+    area_result: AreaAnalysisResult | None = None
+    area_error: str | None = None
     background_parameters: BackgroundParameters = field(
         default_factory=BackgroundParameters
     )
@@ -139,6 +173,20 @@ class RecordingAnalysisState:
     selected_background_id: int | None = None
     background_undo: list[_BackgroundEdit] = field(default_factory=list)
     background_redo: list[_BackgroundEdit] = field(default_factory=list)
+    trace_result: TraceExtractionResult | None = None
+    excluded_pool_reasons: dict[int, str] = field(default_factory=dict)
+
+    @property
+    def motion_ready(self) -> bool:
+        return self.motion_mode == "none" or (
+            self.motion_result is not None and self.motion_accepted
+        )
+
+    @property
+    def effective_motion_correction(self) -> MotionCorrectionResult | None:
+        if self.motion_accepted:
+            return self.motion_result
+        return None
 
     @property
     def effective_peak_index(self) -> int | None:
@@ -156,6 +204,31 @@ class _PeakBatchResult:
 
 
 @dataclass(slots=True)
+class _MotionBatchResult:
+    results: dict[Path, MotionCorrectionResult]
+    failures: dict[Path, str]
+
+
+@dataclass(slots=True)
+class _AnalysisBatchExportResult:
+    results: tuple[AnalysisExportResult, ...]
+    failures: dict[Path, str]
+
+
+def _export_analysis_batch(
+    requests: tuple[AnalysisExportRequest, ...],
+) -> _AnalysisBatchExportResult:
+    results: list[AnalysisExportResult] = []
+    failures: dict[Path, str] = {}
+    for request in requests:
+        try:
+            results.append(export_analysis_bundle(request))
+        except Exception as error:  # noqa: BLE001 - preserve other batch exports
+            failures[request.source_path] = f"{type(error).__name__}: {error}"
+    return _AnalysisBatchExportResult(tuple(results), failures)
+
+
+@dataclass(slots=True)
 class _BackgroundEdit:
     mask_edit: MaskEdit
     before_assignments: dict[int, int | None]
@@ -163,18 +236,52 @@ class _BackgroundEdit:
     description: str
 
 
+@dataclass(slots=True)
+class _TraceReviewItem:
+    path: Path
+    metadata: RecordingMetadata
+    state: RecordingAnalysisState
+    pool_labels: np.ndarray[Any, Any] | None
+    background_labels: np.ndarray[Any, Any] | None
+    trace_readiness_error: str | None = None
+    export_readiness_error: str | None = None
+
+
 def _detect_peak_batch(
-    requests: tuple[tuple[Path, tuple[RectangleBounds, ...]], ...],
+    requests: tuple[
+        tuple[Path, tuple[RectangleBounds, ...], MotionCorrectionResult | None], ...
+    ],
 ) -> _PeakBatchResult:
     """Calculate one independent peak per recording in a single batch action."""
     results: dict[Path, PeakDetectionResult] = {}
     failures: dict[Path, str] = {}
-    for path, rectangles in requests:
+    for path, rectangles, correction in requests:
         try:
-            results[path] = detect_recording_peak(path, rectangles)
+            results[path] = detect_recording_peak(path, rectangles, correction)
         except Exception as error:  # noqa: BLE001 - preserve other batch results
             failures[path] = f"{type(error).__name__}: {error}"
     return _PeakBatchResult(results=results, failures=failures)
+
+
+def _load_motion_preview(
+    path: Path, index: int, transform: FrameTransform
+) -> tuple[int, FrameTransform, np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+    """Read and correct one QC preview frame outside the GUI thread."""
+    frame = read_frame(path, index)
+    return index, transform, frame, apply_frame_transform(frame, transform)
+
+
+def _load_area_review_frame(
+    path: Path,
+    index: int,
+    correction: MotionCorrectionResult | None,
+    pool_labels: np.ndarray[Any, Any],
+    rectangles: tuple[RectangleBounds, ...],
+    parameters: SegmentationParameters,
+) -> tuple[int, np.ndarray[Any, Any], FrameAreaDetection]:
+    frame = read_frame(path, index, correction)
+    detection = detect_frame_pool_areas(frame, pool_labels, rectangles, parameters)
+    return index, frame, detection
 
 
 class DrawingViewBox(pg.ViewBox):
@@ -352,6 +459,95 @@ class _FunctionTask(QRunnable):
             self.signals.succeeded.emit(self.token, result)
 
 
+class _MotionWorkerSignals(QObject):
+    succeeded = Signal(int, object)
+    failed = Signal(int, str)
+    progress = Signal(int, int, int, int, str)
+
+
+class _MotionTask(QRunnable):
+    def __init__(self, token: int, requests: tuple[tuple[Path, str], ...]) -> None:
+        super().__init__()
+        self.token = token
+        self.requests = requests
+        self.signals = _MotionWorkerSignals()
+
+    @Slot()
+    def run(self) -> None:
+        results: dict[Path, MotionCorrectionResult] = {}
+        failures: dict[Path, str] = {}
+        try:
+            total_recordings = len(self.requests)
+            for recording_index, (path, mode) in enumerate(self.requests, start=1):
+                try:
+                    result = estimate_motion_correction(
+                        path,
+                        mode,
+                        progress_callback=lambda frame, total, ri=recording_index, p=path: (
+                            self.signals.progress.emit(
+                                ri, total_recordings, frame, total, p.name
+                            )
+                        ),
+                    )
+                except Exception as error:  # noqa: BLE001
+                    failures[path] = f"{type(error).__name__}: {error}"
+                else:
+                    results[path] = result
+        except Exception as error:  # noqa: BLE001
+            self.signals.failed.emit(self.token, f"{type(error).__name__}: {error}")
+        else:
+            self.signals.succeeded.emit(
+                self.token, _MotionBatchResult(results=results, failures=failures)
+            )
+
+
+class _AreaWorkerSignals(QObject):
+    succeeded = Signal(int, object)
+    failed = Signal(int, str)
+    progress = Signal(int, int, int)
+
+
+class _AreaTask(QRunnable):
+    def __init__(
+        self,
+        token: int,
+        path: Path,
+        pool_labels: np.ndarray[Any, Any],
+        rectangles: tuple[RectangleBounds, ...],
+        peak_frame_index: int,
+        parameters: SegmentationParameters,
+        correction: MotionCorrectionResult | None,
+    ) -> None:
+        super().__init__()
+        self.token = token
+        self.path = path
+        self.pool_labels = pool_labels
+        self.rectangles = rectangles
+        self.peak_frame_index = peak_frame_index
+        self.parameters = parameters
+        self.correction = correction
+        self.signals = _AreaWorkerSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = analyze_recording_areas(
+                self.path,
+                self.pool_labels,
+                self.rectangles,
+                self.peak_frame_index,
+                self.parameters,
+                self.correction,
+                progress_callback=lambda frame, total: self.signals.progress.emit(
+                    self.token, frame, total
+                ),
+            )
+        except Exception as error:  # noqa: BLE001
+            self.signals.failed.emit(self.token, f"{type(error).__name__}: {error}")
+        else:
+            self.signals.succeeded.emit(self.token, result)
+
+
 class ImageCanvas(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -464,6 +660,1291 @@ def _display_levels(frame: np.ndarray[Any, Any]) -> tuple[float, float]:
     return float(low), float(high)
 
 
+class MotionCorrectionDialog(QDialog):
+    """Review correction traces, inspect frames, and adjust individual frames."""
+
+    def __init__(
+        self,
+        path: Path,
+        metadata: RecordingMetadata,
+        result: MotionCorrectionResult,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Review motion correction — {path.name}")
+        self.setModal(True)
+        self._path = path
+        self._metadata = metadata
+        self._result = result
+        self._preview_cache: dict[
+            int, tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]
+        ] = {}
+        self._preview_pending_index: int | None = None
+        self._preview_loading = False
+        self._preview_token = 0
+        self._displayed_preview_index: int | None = None
+        self._preview_initialized = False
+        self._preview_shape: tuple[int, int] | None = None
+        self._preview_thread_pool = QThreadPool(self)
+        self._preview_thread_pool.setMaxThreadCount(1)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(90)
+        self._preview_timer.timeout.connect(self._request_preview)
+
+        outer_layout = QVBoxLayout(self)
+        self.content_scroll_area = QScrollArea()
+        self.content_scroll_area.setObjectName("motionCorrectionScrollArea")
+        self.content_scroll_area.setWidgetResizable(True)
+        self.content_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        self.trace_plot = pg.PlotWidget()
+        self.trace_plot.setMinimumHeight(120)
+        self.trace_plot.setLabel("bottom", "Frame")
+        self.trace_plot.setLabel("left", "Pixels / degrees")
+        self.trace_plot.addLegend()
+
+        self.preview_widget = pg.GraphicsLayoutWidget()
+        self.preview_widget.setMinimumHeight(220)
+        self.preview_widget.addLabel("Original", row=0, col=0)
+        self.preview_widget.addLabel("Corrected", row=0, col=1)
+        self.original_view = self.preview_widget.addViewBox(
+            row=1, col=0, lockAspect=True
+        )
+        self.corrected_view = self.preview_widget.addViewBox(
+            row=1, col=1, lockAspect=True
+        )
+        self.original_view.invertY(True)
+        self.corrected_view.invertY(True)
+        self.original_view.setDefaultPadding(0.02)
+        self.corrected_view.setDefaultPadding(0.02)
+        self.original_item = pg.ImageItem()
+        self.corrected_item = pg.ImageItem()
+        self.original_view.addItem(self.original_item)
+        self.corrected_view.addItem(self.corrected_item)
+        layout.addWidget(self.preview_widget, 1)
+
+        fit_buttons = QHBoxLayout()
+        fit_buttons.addStretch(1)
+        fit_original = QPushButton("Fit original")
+        fit_original.clicked.connect(self._fit_original_preview)
+        fit_corrected = QPushButton("Fit corrected")
+        fit_corrected.clicked.connect(self._fit_corrected_preview)
+        fit_buttons.addWidget(fit_original)
+        fit_buttons.addWidget(fit_corrected)
+        layout.addLayout(fit_buttons)
+        layout.addWidget(self.trace_plot)
+
+        navigation = QHBoxLayout()
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setRange(0, metadata.frame_count - 1)
+        self.frame_slider.valueChanged.connect(self._frame_changed)
+        self.frame_slider.sliderReleased.connect(self._request_preview_immediately)
+        self.frame_spin = QSpinBox()
+        self.frame_spin.setRange(1, metadata.frame_count)
+        self.frame_spin.setPrefix("Frame ")
+        self.frame_spin.valueChanged.connect(
+            lambda value: self.frame_slider.setValue(value - 1)
+        )
+        previous_warning = QPushButton("Previous warning")
+        previous_warning.clicked.connect(lambda: self._jump_warning(-1))
+        next_warning = QPushButton("Next warning")
+        next_warning.clicked.connect(lambda: self._jump_warning(1))
+        navigation.addWidget(previous_warning)
+        navigation.addWidget(self.frame_slider, 1)
+        navigation.addWidget(self.frame_spin)
+        navigation.addWidget(next_warning)
+        layout.addLayout(navigation)
+
+        adjustments = QGridLayout()
+        self.translation_x_spin = QSpinBox()
+        self.translation_x_spin.setRange(
+            -result.parameters.maximum_translation_px,
+            result.parameters.maximum_translation_px,
+        )
+        self.translation_x_spin.setSuffix(" px")
+        self.translation_y_spin = QSpinBox()
+        self.translation_y_spin.setRange(
+            -result.parameters.maximum_translation_px,
+            result.parameters.maximum_translation_px,
+        )
+        self.translation_y_spin.setSuffix(" px")
+        self.rotation_spin = QDoubleSpinBox()
+        self.rotation_spin.setRange(
+            -result.parameters.maximum_rotation_degrees,
+            result.parameters.maximum_rotation_degrees,
+        )
+        self.rotation_spin.setSingleStep(0.5)
+        self.rotation_spin.setDecimals(1)
+        self.rotation_spin.setSuffix("°")
+        self.rotation_spin.setEnabled(result.mode == "rigid")
+        self.apply_motion_adjustment_button = QPushButton(
+            "Apply manual adjustment to this frame"
+        )
+        self.apply_motion_adjustment_button.clicked.connect(self._apply_adjustment)
+        adjustments.addWidget(QLabel("X translation:"), 0, 0)
+        adjustments.addWidget(self.translation_x_spin, 0, 1)
+        adjustments.addWidget(QLabel("Y translation:"), 0, 2)
+        adjustments.addWidget(self.translation_y_spin, 0, 3)
+        adjustments.addWidget(QLabel("Rotation:"), 1, 0)
+        adjustments.addWidget(self.rotation_spin, 1, 1)
+        adjustments.addWidget(self.apply_motion_adjustment_button, 1, 2, 1, 2)
+        layout.addLayout(adjustments)
+
+        self.frame_status = QLabel()
+        self.frame_status.setWordWrap(True)
+        layout.addWidget(self.frame_status)
+        self.content_scroll_area.setWidget(content)
+        outer_layout.addWidget(self.content_scroll_area, 1)
+
+        self.dialog_buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.dialog_buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Accept correction"
+        )
+        self.dialog_buttons.accepted.connect(self.accept)
+        self.dialog_buttons.rejected.connect(self.reject)
+        outer_layout.addWidget(self.dialog_buttons)
+
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            safe_width = max(1, int(available.width() * 0.92))
+            safe_height = max(1, int(available.height() * 0.88))
+            self.setMaximumSize(safe_width, safe_height)
+            self.resize(min(1180, safe_width), min(850, safe_height))
+        self._refresh_plot()
+        initial = result.warning_indices[0] if result.warning_indices else 0
+        self.frame_slider.setValue(initial)
+        self._frame_changed(initial)
+
+    @property
+    def result(self) -> MotionCorrectionResult:
+        return self._result
+
+    def _refresh_plot(self) -> None:
+        self.trace_plot.clear()
+        frames = np.arange(1, len(self._result.transforms) + 1)
+        dx = [item.translation_x_px for item in self._result.transforms]
+        dy = [item.translation_y_px for item in self._result.transforms]
+        angles = [item.rotation_degrees for item in self._result.transforms]
+        self.trace_plot.plot(frames, dx, pen=pg.mkPen("#00cfe8", width=2), name="X px")
+        self.trace_plot.plot(frames, dy, pen=pg.mkPen("#ffd166", width=2), name="Y px")
+        if self._result.mode == "rigid":
+            self.trace_plot.plot(
+                frames,
+                angles,
+                pen=pg.mkPen("#ff7ad9", width=2),
+                name="Rotation °",
+            )
+        warning_indices = self._result.warning_indices
+        if warning_indices:
+            self.trace_plot.plot(
+                np.asarray(warning_indices) + 1,
+                [dx[index] for index in warning_indices],
+                pen=None,
+                symbol="o",
+                symbolBrush="#ff3030",
+                symbolSize=9,
+                name="Warning",
+            )
+        max_translation = max(
+            max(abs(item.translation_x_px), abs(item.translation_y_px))
+            for item in self._result.transforms
+        )
+        max_rotation = max(
+            abs(item.rotation_degrees) for item in self._result.transforms
+        )
+        self.summary_label.setText(
+            f"Mode: {self._result.mode}; reference: frame 1; maximum translation: "
+            f"{max_translation} px; maximum rotation: {max_rotation:.1f}°; "
+            f"warnings: {len(warning_indices)}. Red markers require inspection."
+        )
+
+    @Slot(int)
+    def _frame_changed(self, index: int) -> None:
+        self.frame_spin.blockSignals(True)
+        self.frame_spin.setValue(index + 1)
+        self.frame_spin.blockSignals(False)
+        transform = self._result.transforms[index]
+        for spin in (
+            self.translation_x_spin,
+            self.translation_y_spin,
+            self.rotation_spin,
+        ):
+            spin.blockSignals(True)
+        self.translation_x_spin.setValue(transform.translation_x_px)
+        self.translation_y_spin.setValue(transform.translation_y_px)
+        self.rotation_spin.setValue(transform.rotation_degrees)
+        editable = index != self._result.reference_frame_index
+        self.translation_x_spin.setEnabled(editable)
+        self.translation_y_spin.setEnabled(editable)
+        self.rotation_spin.setEnabled(editable and self._result.mode == "rigid")
+        self.apply_motion_adjustment_button.setEnabled(editable)
+        for spin in (
+            self.translation_x_spin,
+            self.translation_y_spin,
+            self.rotation_spin,
+        ):
+            spin.blockSignals(False)
+        cached = self._preview_cache.get(index)
+        if cached is not None:
+            self._preview_timer.stop()
+            self._preview_pending_index = None
+            self._display_preview(index, *cached)
+        else:
+            self._set_frame_status(index, "Loading preview…")
+            self._preview_timer.start()
+
+    def _set_frame_status(self, index: int, preview_message: str | None = None) -> None:
+        transform = self._result.transforms[index]
+        status = (
+            f"Frame {index + 1}: correlation {transform.correlation:.3f}; "
+            f"X {transform.translation_x_px:+d} px; Y {transform.translation_y_px:+d} px; "
+            f"rotation {transform.rotation_degrees:+.1f}°."
+        )
+        if transform.warning:
+            status += f" Warning: {transform.warning}."
+        if transform.manually_adjusted:
+            status += " Manually adjusted."
+        if preview_message:
+            status += f" {preview_message}"
+        self.frame_status.setText(status)
+
+    @Slot()
+    def _request_preview_immediately(self) -> None:
+        self._preview_timer.stop()
+        self._request_preview()
+
+    @Slot()
+    def _request_preview(self) -> None:
+        index = self.frame_slider.value()
+        cached = self._preview_cache.get(index)
+        if cached is not None:
+            self._preview_pending_index = None
+            self._display_preview(index, *cached)
+            return
+        self._preview_pending_index = index
+        self._start_pending_preview()
+
+    def _start_pending_preview(self) -> None:
+        if self._preview_loading or self._preview_pending_index is None:
+            return
+        index = self._preview_pending_index
+        self._preview_pending_index = None
+        cached = self._preview_cache.get(index)
+        if cached is not None:
+            if index == self.frame_slider.value():
+                self._display_preview(index, *cached)
+            return
+        transform = self._result.transforms[index]
+        self._preview_token += 1
+        token = self._preview_token
+        task = _FunctionTask(
+            token,
+            lambda: _load_motion_preview(self._path, index, transform),
+        )
+        task.signals.succeeded.connect(self._preview_loaded)
+        task.signals.failed.connect(self._preview_failed)
+        self._preview_loading = True
+        self._preview_thread_pool.start(task)
+
+    @Slot(int, object)
+    def _preview_loaded(self, token: int, payload: object) -> None:
+        if token != self._preview_token:
+            return
+        if not isinstance(payload, tuple) or len(payload) != 4:
+            self._preview_loading = False
+            self._set_frame_status(
+                self.frame_slider.value(), "Could not load preview: invalid result."
+            )
+            self._start_pending_preview()
+            return
+        self._preview_loading = False
+        index, transform, frame, corrected = payload
+        if not isinstance(index, int):
+            self._preview_failed(token, "Preview worker returned an invalid frame.")
+            return
+        if transform != self._result.transforms[index]:
+            if index == self.frame_slider.value():
+                self._preview_pending_index = index
+            self._start_pending_preview()
+            return
+        self._preview_cache[index] = (frame, corrected)
+        while len(self._preview_cache) > 3:
+            self._preview_cache.pop(next(iter(self._preview_cache)))
+        if index == self.frame_slider.value():
+            self._display_preview(index, frame, corrected)
+        self._start_pending_preview()
+
+    @Slot(int, str)
+    def _preview_failed(self, token: int, message: str) -> None:
+        if token != self._preview_token:
+            return
+        self._preview_loading = False
+        index = self.frame_slider.value()
+        self._set_frame_status(index, f"Could not load preview: {message}")
+        self._start_pending_preview()
+
+    def _display_preview(
+        self,
+        index: int,
+        frame: np.ndarray[Any, Any],
+        corrected: np.ndarray[Any, Any],
+    ) -> None:
+        levels = _display_levels(frame)
+        self.original_item.setImage(
+            frame,
+            autoLevels=False,
+            levels=levels,
+            autoDownsample=True,
+        )
+        self.corrected_item.setImage(
+            corrected,
+            autoLevels=False,
+            levels=levels,
+            autoDownsample=True,
+        )
+        self._displayed_preview_index = index
+        self._preview_shape = frame.shape
+        self._set_frame_status(index)
+        if not self._preview_initialized:
+            self._preview_initialized = True
+            self._fit_original_preview()
+            self._fit_corrected_preview()
+            QTimer.singleShot(0, self._fit_original_preview)
+            QTimer.singleShot(0, self._fit_corrected_preview)
+
+    @Slot()
+    def _fit_original_preview(self) -> None:
+        self._fit_preview_view(self.original_view)
+
+    @Slot()
+    def _fit_corrected_preview(self) -> None:
+        self._fit_preview_view(self.corrected_view)
+
+    def _fit_preview_view(self, view: pg.ViewBox) -> None:
+        if self._preview_shape is None:
+            return
+        height, width = self._preview_shape
+        view.setRange(
+            QRectF(0.0, 0.0, float(width), float(height)),
+            padding=0.02,
+            disableAutoRange=True,
+        )
+
+    @Slot()
+    def _apply_adjustment(self) -> None:
+        index = self.frame_slider.value()
+        try:
+            self._result = replace_frame_transform(
+                self._path,
+                self._result,
+                index,
+                translation_x_px=self.translation_x_spin.value(),
+                translation_y_px=self.translation_y_spin.value(),
+                rotation_degrees=(
+                    self.rotation_spin.value() if self._result.mode == "rigid" else 0.0
+                ),
+            )
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Adjustment could not be applied", str(error))
+            return
+        self._preview_cache.pop(index, None)
+        self._refresh_plot()
+        self._frame_changed(index)
+
+    def _jump_warning(self, direction: int) -> None:
+        warnings = self._result.warning_indices
+        if not warnings:
+            return
+        current = self.frame_slider.value()
+        ordered = warnings if direction > 0 else tuple(reversed(warnings))
+        target = next(
+            (
+                index
+                for index in ordered
+                if (index > current if direction > 0 else index < current)
+            ),
+            ordered[0],
+        )
+        self.frame_slider.setValue(target)
+
+
+class AreaMaskReviewDialog(QDialog):
+    """Optional frame-by-frame review of thresholded pool-area masks."""
+
+    def __init__(
+        self,
+        path: Path,
+        metadata: RecordingMetadata,
+        correction: MotionCorrectionResult | None,
+        pool_labels: np.ndarray[Any, Any],
+        rectangles: tuple[RectangleBounds, ...],
+        result: AreaAnalysisResult,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Review pool area masks — {path.name}")
+        self.setModal(True)
+        self._path = path
+        self._correction = correction
+        self._pool_labels = np.asarray(pool_labels, dtype=np.int32).copy()
+        self._rectangles = rectangles
+        self._result = result
+        self._cache: dict[int, tuple[np.ndarray[Any, Any], FrameAreaDetection]] = {}
+        self._pending_index: int | None = None
+        self._loading = False
+        self._token = 0
+        self._displayed_index: int | None = None
+        self._preview_shape: tuple[int, int] | None = None
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(1)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(90)
+        self._timer.timeout.connect(self._request_preview)
+
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Cyan/white pixels are detected in this frame. Yellow boundaries are "
+            "the fixed accepted peak-frame masks; detection cannot extend beyond them."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        graphics = pg.GraphicsLayoutWidget()
+        graphics.setMinimumHeight(320)
+        self.view = graphics.addViewBox(lockAspect=True)
+        self.view.invertY(True)
+        self.view.setDefaultPadding(0.02)
+        self.image_item = pg.ImageItem()
+        self.overlay_item = pg.ImageItem()
+        self.overlay_item.setZValue(10)
+        self.view.addItem(self.image_item)
+        self.view.addItem(self.overlay_item)
+        layout.addWidget(graphics, 1)
+
+        controls = QHBoxLayout()
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setRange(0, metadata.frame_count - 1)
+        self.frame_slider.valueChanged.connect(self._frame_changed)
+        self.frame_slider.sliderReleased.connect(self._request_preview_immediately)
+        self.frame_spin = QSpinBox()
+        self.frame_spin.setRange(1, metadata.frame_count)
+        self.frame_spin.setPrefix("Frame ")
+        self.frame_spin.valueChanged.connect(
+            lambda value: self.frame_slider.setValue(value - 1)
+        )
+        fit_button = QPushButton("Fit image")
+        fit_button.clicked.connect(self._fit_image)
+        controls.addWidget(self.frame_slider, 1)
+        controls.addWidget(self.frame_spin)
+        controls.addWidget(fit_button)
+        layout.addLayout(controls)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            safe_width = max(1, int(available.width() * 0.90))
+            safe_height = max(1, int(available.height() * 0.86))
+            self.setMaximumSize(safe_width, safe_height)
+            self.resize(min(1000, safe_width), min(760, safe_height))
+        self.frame_slider.setValue(result.peak_frame_index)
+        self._frame_changed(result.peak_frame_index)
+
+    @Slot(int)
+    def _frame_changed(self, index: int) -> None:
+        self.frame_spin.blockSignals(True)
+        self.frame_spin.setValue(index + 1)
+        self.frame_spin.blockSignals(False)
+        cached = self._cache.get(index)
+        if cached is not None:
+            self._timer.stop()
+            self._pending_index = None
+            self._display_preview(index, *cached)
+        else:
+            self._set_status(index, "Loading mask…")
+            self._timer.start()
+
+    def _set_status(self, index: int, message: str | None = None) -> None:
+        areas = self._result.areas_px[index]
+        qc = self._result.qc_codes[index]
+        missing = [
+            str(pool_id)
+            for pool_id, area in zip(self._result.pool_ids, areas, strict=True)
+            if area == 0
+        ]
+        text = (
+            f"Frame {index + 1}: {int(np.count_nonzero(areas))}/"
+            f"{len(areas)} pools detected; {int(np.sum(areas))} detected pixels; "
+            f"{int(np.count_nonzero(qc))} QC warning(s)."
+        )
+        if missing:
+            visible = ", ".join(missing[:20])
+            text += f" Not detected: {visible}"
+            if len(missing) > 20:
+                text += f" and {len(missing) - 20} more"
+            text += "."
+        if message:
+            text += f" {message}"
+        self.status_label.setText(text)
+
+    @Slot()
+    def _request_preview_immediately(self) -> None:
+        self._timer.stop()
+        self._request_preview()
+
+    @Slot()
+    def _request_preview(self) -> None:
+        index = self.frame_slider.value()
+        cached = self._cache.get(index)
+        if cached is not None:
+            self._pending_index = None
+            self._display_preview(index, *cached)
+            return
+        self._pending_index = index
+        self._start_pending_preview()
+
+    def _start_pending_preview(self) -> None:
+        if self._loading or self._pending_index is None:
+            return
+        index = self._pending_index
+        self._pending_index = None
+        self._token += 1
+        token = self._token
+        task = _FunctionTask(
+            token,
+            lambda: _load_area_review_frame(
+                self._path,
+                index,
+                self._correction,
+                self._pool_labels,
+                self._rectangles,
+                self._result.parameters,
+            ),
+        )
+        task.signals.succeeded.connect(self._preview_loaded)
+        task.signals.failed.connect(self._preview_failed)
+        self._loading = True
+        self._thread_pool.start(task)
+
+    @Slot(int, object)
+    def _preview_loaded(self, token: int, payload: object) -> None:
+        if token != self._token:
+            return
+        self._loading = False
+        if not isinstance(payload, tuple) or len(payload) != 3:
+            self._preview_failed(token, "Preview worker returned an invalid result.")
+            return
+        index, frame, detection = payload
+        if not isinstance(index, int) or not isinstance(detection, FrameAreaDetection):
+            self._preview_failed(token, "Preview worker returned an invalid mask.")
+            return
+        self._cache[index] = (frame, detection)
+        while len(self._cache) > 3:
+            self._cache.pop(next(iter(self._cache)))
+        if index == self.frame_slider.value():
+            self._display_preview(index, frame, detection)
+        self._start_pending_preview()
+
+    @Slot(int, str)
+    def _preview_failed(self, token: int, message: str) -> None:
+        if token != self._token:
+            return
+        self._loading = False
+        self._set_status(self.frame_slider.value(), f"Could not load mask: {message}")
+        self._start_pending_preview()
+
+    def _display_preview(
+        self,
+        index: int,
+        frame: np.ndarray[Any, Any],
+        detection: FrameAreaDetection,
+    ) -> None:
+        first_display = self._preview_shape is None
+        levels = _display_levels(frame)
+        self.image_item.setImage(
+            frame, autoLevels=False, levels=levels, autoDownsample=True
+        )
+        self.overlay_item.setImage(
+            area_masks_to_rgba(self._pool_labels, detection.labels),
+            autoLevels=False,
+            autoDownsample=True,
+        )
+        self._displayed_index = index
+        self._preview_shape = frame.shape
+        self._set_status(index)
+        if index not in self._cache:
+            self._cache[index] = (frame, detection)
+        if first_display:
+            self._fit_image()
+            QTimer.singleShot(0, self._fit_image)
+
+    @Slot()
+    def _fit_image(self) -> None:
+        if self._preview_shape is None:
+            return
+        height, width = self._preview_shape
+        self.view.setRange(
+            QRectF(0.0, 0.0, float(width), float(height)),
+            padding=0.02,
+            disableAutoRange=True,
+        )
+
+
+class TraceReviewDialog(QDialog):
+    """Review raw/normalized pool traces and store per-pool exclusions."""
+
+    TRACE_BATCH_SIZE = 15
+
+    def __init__(
+        self,
+        items: tuple[_TraceReviewItem, ...],
+        *,
+        allow_batch_export: bool,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        if not items:
+            raise ValueError("Trace review requires at least one recording.")
+        self.setWindowTitle("Review pool traces")
+        self.setModal(True)
+        self._items = items
+        self._allow_batch_export = allow_batch_export
+        self._updating_pool_list = False
+        self._trace_batch_index = 0
+        self._trace_token = 0
+        self._loading_index: int | None = None
+        self.requested_export_paths: tuple[Path, ...] = ()
+        self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(1)
+
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Review each pool before export. Unchecked pools are omitted from "
+            "trace, area, and ROI exports, but remain in the workbook audit summary."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        navigation = QHBoxLayout()
+        previous_button = QPushButton("Previous")
+        previous_button.clicked.connect(lambda: self._step_recording(-1))
+        self.recording_combo = QComboBox()
+        for item in items:
+            label = item.path.name
+            if item.export_readiness_error is not None:
+                label += " — incomplete"
+            self.recording_combo.addItem(label)
+        self.recording_combo.currentIndexChanged.connect(self._recording_changed)
+        next_button = QPushButton("Next")
+        next_button.clicked.connect(lambda: self._step_recording(1))
+        navigation.addWidget(previous_button)
+        navigation.addWidget(self.recording_combo, 1)
+        navigation.addWidget(next_button)
+        layout.addLayout(navigation)
+
+        content = QSplitter(Qt.Orientation.Horizontal)
+        plot_panel = QWidget()
+        plot_layout = QVBoxLayout(plot_panel)
+        plot_controls = QHBoxLayout()
+        plot_controls.addWidget(QLabel("Trace display:"))
+        self.trace_mode_combo = QComboBox()
+        self.trace_mode_combo.addItem("Raw intensity", "raw")
+        self.trace_mode_combo.addItem("Normalized (pool − background)", "normalized")
+        self.trace_mode_combo.currentIndexChanged.connect(self._refresh_plot)
+        plot_controls.addWidget(self.trace_mode_combo)
+        self.previous_trace_batch_button = QPushButton("Previous trace batch")
+        self.previous_trace_batch_button.clicked.connect(
+            lambda: self._step_trace_batch(-1)
+        )
+        plot_controls.addWidget(self.previous_trace_batch_button)
+        self.trace_batch_label = QLabel("Trace batch —")
+        self.trace_batch_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        plot_controls.addWidget(self.trace_batch_label)
+        self.next_trace_batch_button = QPushButton("Next trace batch")
+        self.next_trace_batch_button.clicked.connect(lambda: self._step_trace_batch(1))
+        plot_controls.addWidget(self.next_trace_batch_button)
+        fit_traces_button = QPushButton("Fit traces")
+        fit_traces_button.clicked.connect(self._fit_trace_plot)
+        plot_controls.addWidget(fit_traces_button)
+        plot_controls.addStretch(1)
+        plot_layout.addLayout(plot_controls)
+        self.trace_plot = pg.PlotWidget()
+        self.trace_plot.setLabel("bottom", "Frame")
+        self.trace_plot.setLabel("left", "Mean intensity")
+        self.trace_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.trace_plot.setMouseEnabled(x=True, y=True)
+        plot_layout.addWidget(self.trace_plot, 1)
+        self.trace_note = QLabel()
+        self.trace_note.setWordWrap(True)
+        plot_layout.addWidget(self.trace_note)
+        content.addWidget(plot_panel)
+
+        review_panel = QWidget()
+        review_layout = QVBoxLayout(review_panel)
+        review_layout.addWidget(QLabel("Pools included in export"))
+        self.pool_list = QListWidget()
+        self.pool_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.pool_list.itemChanged.connect(self._pool_check_changed)
+        self.pool_list.currentRowChanged.connect(self._pool_selected)
+        review_layout.addWidget(self.pool_list, 1)
+        reason_form = QFormLayout()
+        self.reason_combo = QComboBox()
+        self.reason_combo.addItems(
+            (
+                "Artefact",
+                "Poor segmentation",
+                "Unstable background",
+                "Other",
+            )
+        )
+        self.reason_combo.currentTextChanged.connect(self._reason_preset_changed)
+        self.reason_edit = QLineEdit()
+        self.reason_edit.setPlaceholderText("Optional exclusion note")
+        self.reason_edit.editingFinished.connect(self._reason_changed)
+        reason_form.addRow("Reason preset:", self.reason_combo)
+        reason_form.addRow("Reason / note:", self.reason_edit)
+        review_layout.addLayout(reason_form)
+        content.addWidget(review_panel)
+        content.setStretchFactor(0, 1)
+        content.setStretchFactor(1, 0)
+        content.setSizes((760, 300))
+        layout.addWidget(content, 1)
+
+        self.recording_status = QLabel()
+        self.recording_status.setWordWrap(True)
+        layout.addWidget(self.recording_status)
+        incomplete_count = sum(
+            item.export_readiness_error is not None for item in items
+        )
+        self.batch_status = QLabel(
+            f"{incomplete_count} incomplete recording(s) will be ignored during "
+            "batch export."
+            if incomplete_count
+            else "All listed recordings are ready for trace review and export."
+        )
+        self.batch_status.setWordWrap(True)
+        layout.addWidget(self.batch_status)
+
+        file_buttons = QHBoxLayout()
+        save_button = QPushButton("Save review…")
+        save_button.clicked.connect(self._save_review)
+        load_button = QPushButton("Load review…")
+        load_button.clicked.connect(self._load_review)
+        file_buttons.addWidget(save_button)
+        file_buttons.addWidget(load_button)
+        file_buttons.addStretch(1)
+        layout.addLayout(file_buttons)
+
+        action_buttons = QHBoxLayout()
+        action_buttons.addStretch(1)
+        self.export_current_button = QPushButton("Export this recording…")
+        self.export_current_button.clicked.connect(self._request_current_export)
+        action_buttons.addWidget(self.export_current_button)
+        self.export_all_button = QPushButton("Export all ready recordings…")
+        self.export_all_button.setVisible(allow_batch_export)
+        self.export_all_button.clicked.connect(self._request_batch_export)
+        action_buttons.addWidget(self.export_all_button)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        action_buttons.addWidget(close_button)
+        layout.addLayout(action_buttons)
+
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            safe_width = max(1, int(available.width() * 0.92))
+            safe_height = max(1, int(available.height() * 0.88))
+            self.setMaximumSize(safe_width, safe_height)
+            self.resize(min(1180, safe_width), min(780, safe_height))
+        self._recording_changed(0)
+
+    def _item(self) -> _TraceReviewItem:
+        return self._items[self.recording_combo.currentIndex()]
+
+    @Slot(int)
+    def _recording_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        self._trace_batch_index = 0
+        item = self._items[index]
+        self._populate_pool_list(item)
+        self.trace_plot.clear()
+        if item.trace_readiness_error is not None:
+            self.recording_status.setText(
+                f"Trace preview unavailable: {item.trace_readiness_error}"
+            )
+            self.trace_note.setText("Trace preview is unavailable for this recording.")
+            self._update_export_buttons()
+            return
+        if item.state.trace_result is not None:
+            self.recording_status.setText("Trace data loaded.")
+            self._refresh_plot()
+            self._update_export_buttons()
+            return
+        if item.pool_labels is None or item.background_labels is None:
+            self.recording_status.setText("Ignored: accepted masks are unavailable.")
+            self._update_export_buttons()
+            return
+        self._trace_token += 1
+        token = self._trace_token
+        self._loading_index = index
+        self.recording_status.setText("Loading raw traces from the recording…")
+        self.trace_note.setText("Trace preview is loading.")
+        task = _FunctionTask(
+            token,
+            lambda: extract_recording_traces(
+                item.path,
+                item.pool_labels,
+                item.background_labels,
+                timestamps_s=item.metadata.timestamps_s,
+                motion_correction=item.state.effective_motion_correction,
+            ),
+        )
+        task.signals.succeeded.connect(self._trace_loaded)
+        task.signals.failed.connect(self._trace_failed)
+        self._thread_pool.start(task)
+        self._update_export_buttons()
+
+    def _populate_pool_list(self, item: _TraceReviewItem) -> None:
+        self._updating_pool_list = True
+        self.pool_list.clear()
+        pool_ids = (
+            tuple(int(value) for value in np.unique(item.pool_labels) if value > 0)
+            if item.pool_labels is not None
+            else ()
+        )
+        item.state.excluded_pool_reasons = {
+            pool_id: reason
+            for pool_id, reason in item.state.excluded_pool_reasons.items()
+            if pool_id in pool_ids
+        }
+        for pool_id in pool_ids:
+            excluded = pool_id in item.state.excluded_pool_reasons
+            list_item = QListWidgetItem(
+                f"Pool {pool_id}" + (" — excluded" if excluded else "")
+            )
+            list_item.setData(Qt.ItemDataRole.UserRole, pool_id)
+            list_item.setFlags(list_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            list_item.setCheckState(
+                Qt.CheckState.Unchecked if excluded else Qt.CheckState.Checked
+            )
+            self.pool_list.addItem(list_item)
+        self._updating_pool_list = False
+        if self.pool_list.count():
+            self.pool_list.setCurrentRow(0)
+        else:
+            self.reason_combo.setEnabled(False)
+            self.reason_edit.setEnabled(False)
+
+    @Slot(int, object)
+    def _trace_loaded(self, token: int, result: object) -> None:
+        if token != self._trace_token or not isinstance(result, TraceExtractionResult):
+            return
+        if self._loading_index is None:
+            return
+        item = self._items[self._loading_index]
+        item.state.trace_result = result
+        self._loading_index = None
+        self.recording_status.setText("Trace data loaded.")
+        self._refresh_plot()
+        self._update_export_buttons()
+
+    @Slot(int, str)
+    def _trace_failed(self, token: int, message: str) -> None:
+        if token != self._trace_token:
+            return
+        self._loading_index = None
+        self.recording_status.setText(f"Trace preview failed: {message}")
+        self.trace_note.setText("No trace preview is available.")
+        self._update_export_buttons()
+
+    @Slot()
+    def _refresh_plot(self) -> None:
+        item = self._item()
+        traces = item.state.trace_result
+        self.trace_plot.clear()
+        if traces is None:
+            self._update_trace_batch_controls(0)
+            return
+        x_values = traces.time_s if traces.time_s is not None else traces.frame_numbers
+        self.trace_plot.setLabel(
+            "bottom", "Time", units="s" if traces.time_s is not None else None
+        )
+        mode = self.trace_mode_combo.currentData()
+        values = traces.pool_traces
+        available = np.ones(len(traces.pool_ids), dtype=np.bool_)
+        if mode == "normalized":
+            try:
+                normalized = normalize_pool_traces(
+                    traces.pool_ids,
+                    traces.pool_traces,
+                    traces.background_ids,
+                    traces.background_traces,
+                    background_mode=item.state.background_parameters.mode,
+                    background_assignments=item.state.background_assignments,
+                )
+            except ValueError as error:
+                self.trace_note.setText(
+                    f"Displaying raw traces. Normalized traces are unavailable: {error}"
+                )
+                mode = "raw"
+            else:
+                values = normalized.values.copy()
+                available = normalized.available
+                values[:, ~available] = traces.pool_traces[:, ~available]
+        selected = self._selected_pool_id()
+        batch_count = max(
+            1,
+            (len(traces.pool_ids) + self.TRACE_BATCH_SIZE - 1) // self.TRACE_BATCH_SIZE,
+        )
+        self._trace_batch_index = min(self._trace_batch_index, batch_count - 1)
+        start = self._trace_batch_index * self.TRACE_BATCH_SIZE
+        stop = min(start + self.TRACE_BATCH_SIZE, len(traces.pool_ids))
+        visible_columns = range(start, stop)
+        self._update_trace_batch_controls(len(traces.pool_ids))
+        for visible_index, column in enumerate(visible_columns):
+            pool_id = traces.pool_ids[column]
+            excluded = pool_id in item.state.excluded_pool_reasons
+            colour = pg.intColor(
+                visible_index,
+                hues=max(1, stop - start),
+                values=1,
+                maxValue=230,
+                minValue=150,
+                maxHue=300,
+            )
+            pen = pg.mkPen(
+                colour,
+                width=4 if pool_id == selected else (1 if excluded else 2),
+                style=Qt.PenStyle.DashLine if excluded else Qt.PenStyle.SolidLine,
+            )
+            curve = self.trace_plot.plot(
+                x_values,
+                values[:, column],
+                pen=pen,
+                name=f"Pool {pool_id}",
+            )
+            curve.setCurveClickable(True, width=12)
+            curve.sigClicked.connect(
+                lambda _curve, _event, value=pool_id: self._trace_clicked(value)
+            )
+        if mode == "raw":
+            self.trace_plot.setLabel("left", "Raw mean intensity")
+            self.trace_note.setText(
+                "Displaying raw pool intensity traces. Dashed traces are excluded "
+                "from export."
+            )
+        else:
+            unavailable_ids = [
+                str(pool_id)
+                for column, (pool_id, ok) in enumerate(
+                    zip(traces.pool_ids, available, strict=True)
+                )
+                if start <= column < stop and not ok
+            ]
+            self.trace_plot.setLabel("left", "Normalized intensity")
+            if unavailable_ids:
+                self.trace_note.setText(
+                    "Normalized display is unavailable for pool(s) "
+                    + ", ".join(unavailable_ids)
+                    + "; their raw traces are shown instead. The first-10-frame "
+                    "background-corrected baseline was zero or near zero."
+                )
+            else:
+                self.trace_note.setText(
+                    "Displaying (pool − assigned background) divided by the mean "
+                    "background-corrected signal in frames 1–10. Dashed traces are excluded."
+                )
+        self._fit_trace_plot()
+        QTimer.singleShot(0, self._fit_trace_plot)
+
+    def _update_trace_batch_controls(self, pool_count: int) -> None:
+        batch_count = max(
+            1,
+            (pool_count + self.TRACE_BATCH_SIZE - 1) // self.TRACE_BATCH_SIZE,
+        )
+        self._trace_batch_index = min(self._trace_batch_index, batch_count - 1)
+        start = self._trace_batch_index * self.TRACE_BATCH_SIZE
+        stop = min(start + self.TRACE_BATCH_SIZE, pool_count)
+        if pool_count:
+            self.trace_batch_label.setText(
+                f"Pools {start + 1}–{stop} of {pool_count} "
+                f"(batch {self._trace_batch_index + 1}/{batch_count})"
+            )
+        else:
+            self.trace_batch_label.setText("No pool traces")
+        self.previous_trace_batch_button.setEnabled(self._trace_batch_index > 0)
+        self.next_trace_batch_button.setEnabled(
+            pool_count > 0 and self._trace_batch_index + 1 < batch_count
+        )
+
+    def _step_trace_batch(self, offset: int) -> None:
+        traces = self._item().state.trace_result
+        if traces is None:
+            return
+        batch_count = max(
+            1,
+            (len(traces.pool_ids) + self.TRACE_BATCH_SIZE - 1) // self.TRACE_BATCH_SIZE,
+        )
+        target = min(max(0, self._trace_batch_index + offset), batch_count - 1)
+        if target != self._trace_batch_index:
+            self._trace_batch_index = target
+            self._refresh_plot()
+
+    @Slot()
+    def _fit_trace_plot(self) -> None:
+        self.trace_plot.getPlotItem().getViewBox().autoRange(padding=0.05)
+
+    def _trace_clicked(self, pool_id: int) -> None:
+        # The click signal is emitted while QGraphicsScene is still processing
+        # mouseReleaseEvent. Selecting the list row redraws the plot and deletes
+        # its curves, so defer that redraw until the scene has finished the event.
+        QTimer.singleShot(0, lambda value=pool_id: self._select_clicked_trace(value))
+
+    def _select_clicked_trace(self, pool_id: int) -> None:
+        for row in range(self.pool_list.count()):
+            list_item = self.pool_list.item(row)
+            if int(list_item.data(Qt.ItemDataRole.UserRole)) == pool_id:
+                self.pool_list.setCurrentRow(row)
+                self.pool_list.scrollToItem(
+                    list_item, QAbstractItemView.ScrollHint.PositionAtCenter
+                )
+                self.recording_status.setText(
+                    f"Selected pool {pool_id} by clicking its trace."
+                )
+                return
+
+    def _selected_pool_id(self) -> int | None:
+        selected = self.pool_list.currentItem()
+        return (
+            int(selected.data(Qt.ItemDataRole.UserRole))
+            if selected is not None
+            else None
+        )
+
+    @Slot(QListWidgetItem)
+    def _pool_check_changed(self, list_item: QListWidgetItem) -> None:
+        if self._updating_pool_list:
+            return
+        pool_id = int(list_item.data(Qt.ItemDataRole.UserRole))
+        state = self._item().state
+        if list_item.checkState() == Qt.CheckState.Checked:
+            state.excluded_pool_reasons.pop(pool_id, None)
+        else:
+            state.excluded_pool_reasons[pool_id] = self.reason_combo.currentText()
+        self._populate_pool_list(self._item())
+        for row in range(self.pool_list.count()):
+            if int(self.pool_list.item(row).data(Qt.ItemDataRole.UserRole)) == pool_id:
+                self.pool_list.setCurrentRow(row)
+                break
+        self._refresh_plot()
+        self._update_export_buttons()
+
+    @Slot(int)
+    def _pool_selected(self, _row: int) -> None:
+        pool_id = self._selected_pool_id()
+        if pool_id is None:
+            self.reason_combo.setEnabled(False)
+            self.reason_edit.setEnabled(False)
+            return
+        traces = self._item().state.trace_result
+        if traces is not None and pool_id in traces.pool_ids:
+            column = traces.pool_ids.index(pool_id)
+            target_batch = column // self.TRACE_BATCH_SIZE
+            if target_batch != self._trace_batch_index:
+                self._trace_batch_index = target_batch
+        reason = self._item().state.excluded_pool_reasons.get(pool_id, "")
+        excluded = bool(reason) or pool_id in self._item().state.excluded_pool_reasons
+        self.reason_combo.setEnabled(excluded)
+        self.reason_edit.setEnabled(excluded)
+        self.reason_edit.blockSignals(True)
+        self.reason_edit.setText(reason)
+        self.reason_edit.blockSignals(False)
+        if reason in {
+            "Artefact",
+            "Poor segmentation",
+            "Unstable background",
+            "Other",
+        }:
+            self.reason_combo.blockSignals(True)
+            self.reason_combo.setCurrentText(reason)
+            self.reason_combo.blockSignals(False)
+        self._refresh_plot()
+
+    @Slot(str)
+    def _reason_preset_changed(self, text: str) -> None:
+        pool_id = self._selected_pool_id()
+        if pool_id is None or pool_id not in self._item().state.excluded_pool_reasons:
+            return
+        self.reason_edit.blockSignals(True)
+        self.reason_edit.setText(text)
+        self.reason_edit.blockSignals(False)
+        self._item().state.excluded_pool_reasons[pool_id] = text
+
+    @Slot()
+    def _reason_changed(self, *_args: object) -> None:
+        pool_id = self._selected_pool_id()
+        if pool_id is None or pool_id not in self._item().state.excluded_pool_reasons:
+            return
+        text = self.reason_edit.text().strip()
+        if not text:
+            text = self.reason_combo.currentText()
+            self.reason_edit.blockSignals(True)
+            self.reason_edit.setText(text)
+            self.reason_edit.blockSignals(False)
+        self._item().state.excluded_pool_reasons[pool_id] = text
+
+    def _step_recording(self, offset: int) -> None:
+        count = self.recording_combo.count()
+        self.recording_combo.setCurrentIndex(
+            (self.recording_combo.currentIndex() + offset) % count
+        )
+
+    def _decision(self, item: _TraceReviewItem) -> TraceReviewDecision | None:
+        if item.pool_labels is None:
+            return None
+        pool_ids = tuple(
+            int(value) for value in np.unique(item.pool_labels) if value > 0
+        )
+        if not pool_ids:
+            return None
+        return TraceReviewDecision(
+            source_path=str(item.path),
+            source_filename=item.path.name,
+            file_size_bytes=item.metadata.file_size_bytes,
+            pool_ids=pool_ids,
+            excluded_reasons=dict(item.state.excluded_pool_reasons),
+        )
+
+    @Slot()
+    def _save_review(self) -> None:
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Save trace review",
+            str(self._item().path.parent / "trace_review.json"),
+            "JSON manifest (*.json)",
+        )
+        if not selected:
+            return
+        decisions = tuple(
+            decision
+            for item in self._items
+            if (decision := self._decision(item)) is not None
+        )
+        try:
+            write_review_manifest(Path(selected), decisions, overwrite=True)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not save review", str(error))
+            return
+        self.batch_status.setText(f"Saved review decisions to {selected}")
+
+    @Slot()
+    def _load_review(self) -> None:
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Load trace review",
+            str(self._item().path.parent),
+            "JSON manifest (*.json)",
+        )
+        if not selected:
+            return
+        try:
+            decisions = read_review_manifest(Path(selected))
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            QMessageBox.warning(self, "Could not load review", str(error))
+            return
+        applied = 0
+        skipped = 0
+        for item in self._items:
+            decision = next(
+                (
+                    value
+                    for value in decisions
+                    if Path(value.source_path) == item.path
+                    or (
+                        value.source_filename == item.path.name
+                        and value.file_size_bytes == item.metadata.file_size_bytes
+                    )
+                ),
+                None,
+            )
+            current = self._decision(item)
+            if (
+                decision is None
+                or current is None
+                or decision.pool_ids != current.pool_ids
+            ):
+                skipped += 1
+                continue
+            item.state.excluded_pool_reasons = dict(decision.excluded_reasons)
+            applied += 1
+        self._populate_pool_list(self._item())
+        self._refresh_plot()
+        self._update_export_buttons()
+        self.batch_status.setText(
+            f"Loaded review: {applied} recording(s) matched; {skipped} ignored because "
+            "the file or accepted pool masks did not match."
+        )
+
+    def _included_pool_ids(self, item: _TraceReviewItem) -> tuple[int, ...]:
+        if item.pool_labels is None:
+            return ()
+        return tuple(
+            int(value)
+            for value in np.unique(item.pool_labels)
+            if value > 0 and int(value) not in item.state.excluded_pool_reasons
+        )
+
+    def _update_export_buttons(self) -> None:
+        item = self._item()
+        current_ready = item.export_readiness_error is None and bool(
+            self._included_pool_ids(item)
+        )
+        self.export_current_button.setEnabled(current_ready)
+        batch_ready = any(
+            value.export_readiness_error is None and self._included_pool_ids(value)
+            for value in self._items
+        )
+        self.export_all_button.setEnabled(self._allow_batch_export and batch_ready)
+
+    @Slot()
+    def _request_current_export(self) -> None:
+        item = self._item()
+        if item.export_readiness_error is not None or not self._included_pool_ids(item):
+            return
+        self.requested_export_paths = (item.path,)
+        self.accept()
+
+    @Slot()
+    def _request_batch_export(self) -> None:
+        ready_exists = any(
+            item.export_readiness_error is None and self._included_pool_ids(item)
+            for item in self._items
+        )
+        if ready_exists:
+            self.requested_export_paths = tuple(item.path for item in self._items)
+            self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -478,12 +1959,20 @@ class MainWindow(QMainWindow):
         self._analysis_thread_pool.setMaxThreadCount(1)
         self._metadata_token = 0
         self._frame_token = 0
+        self._motion_token = 0
+        self._motion_running = False
+        self._corrected_export_token = 0
+        self._corrected_export_running = False
         self._peak_token = 0
         self._peak_batch_running = False
         self._segmentation_token = 0
+        self._area_token = 0
+        self._area_running = False
+        self._area_path: Path | None = None
         self._background_token = 0
         self._export_token = 0
         self._export_running = False
+        self._batch_skipped_count = 0
         self._last_export_directory: Path | None = None
         self._current_path: Path | None = None
         self._metadata: RecordingMetadata | None = None
@@ -645,9 +2134,55 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
     def _create_analysis_controls(self) -> QWidget:
-        group = QGroupBox("Analysis regions and peak")
+        group = QGroupBox("Motion correction and analysis")
         group.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout = QVBoxLayout(group)
+
+        layout.addWidget(QLabel("XY motion correction"))
+        motion_help = QLabel(
+            "Choose no correction, integer-pixel translation, or rigid correction "
+            "with nearest-neighbor rotation. A choice must be accepted before analysis."
+        )
+        motion_help.setWordWrap(True)
+        layout.addWidget(motion_help)
+        self.motion_mode_combo = QComboBox()
+        self.motion_mode_combo.addItem("Choose correction…", None)
+        self.motion_mode_combo.addItem("No correction", "none")
+        self.motion_mode_combo.addItem("Translation (whole pixels)", "translation")
+        self.motion_mode_combo.addItem("Rigid body (nearest-neighbor)", "rigid")
+        self.motion_mode_combo.currentIndexChanged.connect(self._motion_mode_changed)
+        layout.addWidget(self.motion_mode_combo)
+
+        motion_calculation_buttons = QHBoxLayout()
+        self.calculate_motion_button = QPushButton("Calculate current")
+        self.calculate_motion_button.clicked.connect(self._start_current_motion)
+        self.calculate_all_motion_button = QPushButton("Calculate all")
+        self.calculate_all_motion_button.setToolTip(
+            "Apply the current correction mode to every loaded recording and calculate sequentially"
+        )
+        self.calculate_all_motion_button.clicked.connect(self._start_all_motion)
+        motion_calculation_buttons.addWidget(self.calculate_motion_button)
+        motion_calculation_buttons.addWidget(self.calculate_all_motion_button)
+        layout.addLayout(motion_calculation_buttons)
+
+        motion_result_buttons = QHBoxLayout()
+        self.review_motion_button = QPushButton("Review / adjust")
+        self.review_motion_button.clicked.connect(self._review_motion_correction)
+        self.save_corrected_button = QPushButton("Save corrected images…")
+        self.save_corrected_button.clicked.connect(self._start_corrected_export)
+        motion_result_buttons.addWidget(self.review_motion_button)
+        motion_result_buttons.addWidget(self.save_corrected_button)
+        layout.addLayout(motion_result_buttons)
+        self.motion_summary_label = QLabel(
+            "Choose a correction option before drawing analysis regions."
+        )
+        self.motion_summary_label.setWordWrap(True)
+        layout.addWidget(self.motion_summary_label)
+
+        motion_separator = QFrame()
+        motion_separator.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(motion_separator)
+        layout.addWidget(QLabel("Analysis regions and recording peak"))
 
         help_label = QLabel(
             "Regions are locked during analysis. Enable region editing to add, "
@@ -862,6 +2397,30 @@ class MainWindow(QMainWindow):
         self.correction_summary_label.setWordWrap(True)
         layout.addWidget(self.correction_summary_label)
 
+        area_separator = QFrame()
+        area_separator.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(area_separator)
+        layout.addWidget(QLabel("Pool area over time"))
+        area_help = QLabel(
+            "Measure detected pixels independently in every frame, strictly inside "
+            "each accepted peak-frame pool mask. Reviewing masks is optional."
+        )
+        area_help.setWordWrap(True)
+        layout.addWidget(area_help)
+        area_buttons = QHBoxLayout()
+        self.calculate_areas_button = QPushButton("Calculate areas")
+        self.calculate_areas_button.clicked.connect(self._start_area_analysis)
+        self.review_areas_button = QPushButton("Review masks…")
+        self.review_areas_button.clicked.connect(self._review_area_masks)
+        area_buttons.addWidget(self.calculate_areas_button)
+        area_buttons.addWidget(self.review_areas_button)
+        layout.addLayout(area_buttons)
+        self.area_summary_label = QLabel(
+            "Finish pool segmentation before calculating areas."
+        )
+        self.area_summary_label.setWordWrap(True)
+        layout.addWidget(self.area_summary_label)
+
         background_separator = QFrame()
         background_separator.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(background_separator)
@@ -1005,12 +2564,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(export_separator)
         layout.addWidget(QLabel("Trace and ImageJ ROI export"))
         export_help = QLabel(
-            "Exports raw pool and background mean-intensity traces to XLSX, "
-            "final regions to an ImageJ-compatible ROI ZIP, and the current "
-            "display gradient to an ImageJ LUT."
+            "Review raw or normalized pool traces, optionally exclude individual "
+            "pools, then export raw and normalized data to XLSX, final regions to "
+            "an ImageJ-compatible ROI ZIP, and the current display gradient to LUT."
         )
         export_help.setWordWrap(True)
         layout.addWidget(export_help)
+        self.review_current_traces_button = QPushButton("Review current recording…")
+        self.review_current_traces_button.clicked.connect(
+            lambda: self._open_trace_review(False)
+        )
+        layout.addWidget(self.review_current_traces_button)
+        self.review_all_traces_button = QPushButton("Review all / batch export…")
+        self.review_all_traces_button.clicked.connect(
+            lambda: self._open_trace_review(True)
+        )
+        layout.addWidget(self.review_all_traces_button)
         self.export_analysis_button = QPushButton("Export current recording…")
         self.export_analysis_button.clicked.connect(self._start_analysis_export)
         layout.addWidget(self.export_analysis_button)
@@ -1151,10 +2720,14 @@ class MainWindow(QMainWindow):
         self.load_recordings(recordings)
 
     def load_recordings(self, recordings: list[Path]) -> None:
+        self._motion_token += 1
+        self._corrected_export_token += 1
         self._peak_token += 1
         self._background_token += 1
         self._export_token += 1
         self._peak_batch_running = False
+        self._motion_running = False
+        self._corrected_export_running = False
         self.recording_list.setEnabled(True)
         self._stop_playback()
         self._stop_all_drawing()
@@ -1178,6 +2751,7 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         self._frame_token += 1
+        self._corrected_export_token += 1
         self._peak_token += 1
         self._segmentation_token += 1
         self._background_token += 1
@@ -1225,7 +2799,6 @@ class MainWindow(QMainWindow):
         self.frame_spin.blockSignals(False)
         self.frame_slider.setEnabled(True)
         self.frame_spin.setEnabled(True)
-        self.draw_region_action.setEnabled(True)
         self._update_frame_label(0)
         self._restore_analysis_state()
         self._request_frame(0)
@@ -1258,10 +2831,12 @@ class MainWindow(QMainWindow):
         if self._current_path is None or self._metadata is None:
             return
         path = self._current_path
+        state = self.current_analysis_state
+        correction = None if state is None else state.effective_motion_correction
         self._frame_token += 1
         token = self._frame_token
         self._thread_pool.clear()
-        task = _FunctionTask(token, lambda: read_frame(path, index))
+        task = _FunctionTask(token, lambda: read_frame(path, index, correction))
         task.signals.succeeded.connect(self._frame_loaded)
         task.signals.failed.connect(self._frame_failed)
         self.statusBar().showMessage(
@@ -1373,6 +2948,370 @@ class MainWindow(QMainWindow):
             label.setText("—")
         self.frame_label.setText("Loading metadata…")
 
+    def _restore_motion_state(self) -> None:
+        state = self.current_analysis_state
+        self.motion_mode_combo.blockSignals(True)
+        mode = None if state is None else state.motion_mode
+        index = self.motion_mode_combo.findData(mode)
+        self.motion_mode_combo.setCurrentIndex(max(0, index))
+        self.motion_mode_combo.blockSignals(False)
+        self._show_motion_state()
+
+    @Slot(int)
+    def _motion_mode_changed(self, _index: int) -> None:
+        state = self.current_analysis_state
+        if state is None:
+            return
+        mode = self.motion_mode_combo.currentData()
+        if mode == state.motion_mode:
+            return
+        if state.rectangles or state.peak_result is not None:
+            answer = QMessageBox.warning(
+                self,
+                "Change motion correction?",
+                "Changing motion correction invalidates the recording peak, pool "
+                "segmentation, backgrounds, and exports. Analysis rectangles remain "
+                "in the first-frame coordinate system. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._restore_motion_state()
+                return
+        state.motion_mode = mode
+        state.motion_result = None
+        state.motion_error = None
+        state.motion_accepted = mode == "none"
+        self._clear_motion_dependents(state)
+        self._restore_analysis_state()
+        self._request_frame(self.frame_slider.value())
+
+    @Slot()
+    def _start_current_motion(self) -> None:
+        state = self.current_analysis_state
+        if self._current_path is None or state is None:
+            return
+        if state.motion_mode not in {"translation", "rigid"}:
+            QMessageBox.information(
+                self,
+                "Choose a correction mode",
+                "Choose Translation or Rigid body before calculating correction.",
+            )
+            return
+        self._start_motion_requests(((self._current_path, state.motion_mode),))
+
+    @Slot()
+    def _start_all_motion(self) -> None:
+        state = self.current_analysis_state
+        if state is None or state.motion_mode not in {"translation", "rigid"}:
+            QMessageBox.information(
+                self,
+                "Choose a correction mode",
+                "Choose Translation or Rigid body on the current recording. That "
+                "mode will be applied to every loaded recording.",
+            )
+            return
+        if any(
+            item.rectangles or item.peak_result is not None
+            for item in self._analysis_states.values()
+        ):
+            answer = QMessageBox.warning(
+                self,
+                "Recalculate all corrections?",
+                "This will invalidate existing peaks, segmentations, and backgrounds "
+                "for every loaded recording. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        mode = state.motion_mode
+        requests: list[tuple[Path, str]] = []
+        for path, analysis_state in self._analysis_states.items():
+            analysis_state.motion_mode = mode
+            analysis_state.motion_result = None
+            analysis_state.motion_accepted = False
+            analysis_state.motion_error = None
+            self._clear_motion_dependents(analysis_state)
+            requests.append((path, mode))
+        self._start_motion_requests(tuple(requests))
+
+    def _start_motion_requests(self, requests: tuple[tuple[Path, str], ...]) -> None:
+        if not requests or self._motion_running:
+            return
+        for path, mode in requests:
+            state = self._analysis_states[path]
+            state.motion_mode = mode
+            state.motion_result = None
+            state.motion_accepted = False
+            state.motion_error = None
+            self._clear_motion_dependents(state)
+        self._stop_playback()
+        self._stop_all_drawing()
+        self._motion_token += 1
+        token = self._motion_token
+        task = _MotionTask(token, requests)
+        task.signals.succeeded.connect(self._motion_finished)
+        task.signals.failed.connect(self._motion_failed)
+        task.signals.progress.connect(self._motion_progress)
+        self._motion_running = True
+        self.recording_list.setEnabled(False)
+        self.open_file_action.setEnabled(False)
+        self.open_folder_action.setEnabled(False)
+        self.analysis_controls.setEnabled(False)
+        self.motion_summary_label.setText(
+            f"Calculating correction for {len(requests)} recording(s) against frame 1…"
+        )
+        self.statusBar().showMessage(
+            f"Calculating motion correction for {len(requests)} recording(s)"
+        )
+        self._show_motion_state()
+        self._analysis_thread_pool.start(task)
+
+    @Slot(int, int, int, int, str)
+    def _motion_progress(
+        self,
+        recording_index: int,
+        recording_count: int,
+        frame_index: int,
+        frame_count: int,
+        filename: str,
+    ) -> None:
+        if not self._motion_running:
+            return
+        message = (
+            f"Correcting recording {recording_index}/{recording_count}: {filename}; "
+            f"frame {frame_index}/{frame_count}"
+        )
+        self.motion_summary_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    @Slot(int, object)
+    def _motion_finished(self, token: int, payload: object) -> None:
+        if token != self._motion_token or not isinstance(payload, _MotionBatchResult):
+            return
+        self._motion_running = False
+        self.recording_list.setEnabled(True)
+        self.open_file_action.setEnabled(True)
+        self.open_folder_action.setEnabled(True)
+        self.analysis_controls.setEnabled(True)
+        for path, result in payload.results.items():
+            state = self._analysis_states.get(path)
+            if state is not None:
+                state.motion_result = result
+                state.motion_accepted = False
+                state.motion_error = None
+        for path, message in payload.failures.items():
+            state = self._analysis_states.get(path)
+            if state is not None:
+                state.motion_error = message
+        self._restore_motion_state()
+        completed, failed = len(payload.results), len(payload.failures)
+        self.statusBar().showMessage(
+            f"Calculated {completed} motion correction(s)"
+            + (f"; {failed} failed" if failed else "")
+        )
+        current = self.current_analysis_state
+        if current is not None and current.motion_result is not None:
+            self._review_motion_correction()
+
+    @Slot(int, str)
+    def _motion_failed(self, token: int, message: str) -> None:
+        if token != self._motion_token:
+            return
+        self._motion_running = False
+        self.recording_list.setEnabled(True)
+        self.open_file_action.setEnabled(True)
+        self.open_folder_action.setEnabled(True)
+        self.analysis_controls.setEnabled(True)
+        state = self.current_analysis_state
+        if state is not None:
+            state.motion_error = message
+        self._show_motion_state()
+        self.statusBar().showMessage("Motion correction failed")
+        self._show_error("Could not calculate motion correction", message)
+
+    @Slot()
+    def _review_motion_correction(self) -> None:
+        state = self.current_analysis_state
+        if (
+            self._current_path is None
+            or self._metadata is None
+            or state is None
+            or state.motion_result is None
+        ):
+            return
+        previous_result = state.motion_result
+        dialog = MotionCorrectionDialog(
+            self._current_path, self._metadata, previous_result, self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._show_motion_state()
+            return
+        if state.peak_result is not None and dialog.result != previous_result:
+            self._clear_motion_dependents(state)
+        state.motion_result = dialog.result
+        state.motion_accepted = True
+        state.motion_error = None
+        self._show_motion_state()
+        self._show_peak_state()
+        self._request_frame(self.frame_slider.value())
+        self.statusBar().showMessage(
+            f"Accepted {state.motion_result.mode} correction for {self._current_path.name}"
+        )
+
+    def _show_motion_state(self) -> None:
+        if not hasattr(self, "motion_mode_combo"):
+            return
+        state = self.current_analysis_state
+        available = self._metadata is not None and not self._motion_running
+        self.motion_mode_combo.setEnabled(available)
+        calculate = (
+            available
+            and state is not None
+            and state.motion_mode in {"translation", "rigid"}
+        )
+        self.calculate_motion_button.setEnabled(calculate)
+        self.calculate_all_motion_button.setEnabled(calculate)
+        has_result = available and state is not None and state.motion_result is not None
+        self.review_motion_button.setEnabled(has_result)
+        self.save_corrected_button.setEnabled(
+            bool(
+                has_result
+                and state.motion_accepted
+                and not self._corrected_export_running
+            )
+        )
+        if state is None or state.motion_mode is None:
+            message = "Choose a correction option before drawing analysis regions."
+        elif state.motion_mode == "none":
+            message = "No correction selected and accepted. Analysis uses original ND2 frames."
+        elif state.motion_error:
+            message = f"Correction failed: {state.motion_error}"
+        elif state.motion_result is None:
+            message = f"{state.motion_mode.title()} correction has not been calculated."
+        else:
+            warnings = len(state.motion_result.warning_indices)
+            acceptance = "accepted" if state.motion_accepted else "not yet accepted"
+            message = (
+                f"{state.motion_mode.title()} correction calculated; {warnings} warning "
+                f"frame(s); {acceptance}. Review the QC before analysis."
+            )
+        self.motion_summary_label.setText(message)
+        ready = state is not None and state.motion_ready and not self._motion_running
+        self.draw_region_action.setEnabled(self._metadata is not None and ready)
+        self._sync_region_edit_button()
+        self._update_region_actions()
+
+    def _clear_motion_dependents(self, state: RecordingAnalysisState) -> None:
+        state.peak_result = None
+        state.peak_error = None
+        state.manual_peak_index = None
+        state.segmentation_result = None
+        state.corrected_labels = None
+        state.correction_undo.clear()
+        state.correction_redo.clear()
+        state.selected_pool_ids.clear()
+        state.area_result = None
+        state.area_error = None
+        state.background_result = None
+        state.corrected_background_labels = None
+        state.background_assignments.clear()
+        state.background_undo.clear()
+        state.background_redo.clear()
+        state.selected_background_id = None
+        state.trace_result = None
+        state.excluded_pool_reasons.clear()
+
+    @Slot()
+    def _start_corrected_export(self) -> None:
+        state = self.current_analysis_state
+        if (
+            self._current_path is None
+            or self._metadata is None
+            or state is None
+            or state.effective_motion_correction is None
+            or self._corrected_export_running
+        ):
+            return
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Choose folder for corrected recording",
+            str(self._last_export_directory or self._current_path.parent),
+        )
+        if not selected:
+            return
+        output_directory = Path(selected)
+        self._last_export_directory = output_directory
+        stem = f"{self._current_path.stem}_registered"
+        expected = (
+            output_directory / f"{stem}.ome.tif",
+            output_directory / f"{stem}_transforms.csv",
+            output_directory / f"{stem}_metadata.json",
+        )
+        overwrite = any(path.exists() for path in expected)
+        if overwrite:
+            answer = QMessageBox.warning(
+                self,
+                "Replace corrected recording files?",
+                "One or more corrected output files already exist. Replace them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        path = self._current_path
+        metadata = self._metadata
+        correction = state.effective_motion_correction
+        self._corrected_export_token += 1
+        token = self._corrected_export_token
+        task = _FunctionTask(
+            token,
+            lambda: export_corrected_recording(
+                path,
+                output_directory,
+                metadata,
+                correction,
+                overwrite=overwrite,
+            ),
+        )
+        task.signals.succeeded.connect(self._corrected_export_finished)
+        task.signals.failed.connect(self._corrected_export_failed)
+        self._corrected_export_running = True
+        self.save_corrected_button.setEnabled(False)
+        self.save_corrected_button.setText("Saving corrected images…")
+        self.statusBar().showMessage(f"Saving corrected recording: {path.name}")
+        self._analysis_thread_pool.start(task)
+
+    @Slot(int, object)
+    def _corrected_export_finished(self, token: int, payload: object) -> None:
+        if token != self._corrected_export_token or not isinstance(
+            payload, CorrectedRecordingExportResult
+        ):
+            return
+        self._corrected_export_running = False
+        self.save_corrected_button.setText("Save corrected images…")
+        self._show_motion_state()
+        self.statusBar().showMessage(
+            f"Saved corrected recording: {payload.ome_tiff_path.name}"
+        )
+        QMessageBox.information(
+            self,
+            "Corrected recording saved",
+            f"Saved {payload.frame_count} corrected frames as:\n"
+            f"{payload.ome_tiff_path}\n\nTransform and QC files were saved beside it.",
+        )
+
+    @Slot(int, str)
+    def _corrected_export_failed(self, token: int, message: str) -> None:
+        if token != self._corrected_export_token:
+            return
+        self._corrected_export_running = False
+        self.save_corrected_button.setText("Save corrected images…")
+        self._show_motion_state()
+        self.statusBar().showMessage("Corrected recording export failed")
+        self._show_error("Could not save corrected recording", message)
+
     @Slot(bool)
     def _set_region_drawing(self, enabled: bool) -> None:
         if enabled:
@@ -1458,6 +3397,11 @@ class MainWindow(QMainWindow):
         state = self.current_analysis_state
         if self._metadata is None or state is None:
             return False
+        if not state.motion_ready:
+            self.statusBar().showMessage(
+                "Choose and accept motion correction before adding analysis regions"
+            )
+            return False
         if rectangle.x1 > self._metadata.width or rectangle.y1 > self._metadata.height:
             raise ValueError("Analysis rectangle exceeds the image bounds.")
 
@@ -1492,10 +3436,12 @@ class MainWindow(QMainWindow):
         state = self.current_analysis_state
         if state is None or self._metadata is None:
             return
+        self._restore_motion_state()
         self.manual_peak_spin.setRange(1, self._metadata.frame_count)
         self._rebuild_region_items()
         self._show_peak_state()
         self._restore_segmentation_state()
+        self._show_area_state()
         self._restore_background_state()
 
     def _rebuild_region_items(self, selected_index: int | None = None) -> None:
@@ -1704,7 +3650,12 @@ class MainWindow(QMainWindow):
             and self._selected_region_index >= 0
             and self._selected_region_index < len(state.rectangles)
         )
-        can_edit = not self._peak_batch_running
+        can_edit = (
+            not self._peak_batch_running
+            and not self._motion_running
+            and state is not None
+            and state.motion_ready
+        )
         self.delete_region_action.setEnabled(has_selection and can_edit)
         self.clear_regions_action.setEnabled(has_regions and can_edit)
         self.find_peak_button.setEnabled(has_any_regions and can_edit)
@@ -1733,9 +3684,13 @@ class MainWindow(QMainWindow):
     @Slot()
     def _start_peak_detection(self) -> None:
         requests = tuple(
-            (path, tuple(state.rectangles))
+            (
+                path,
+                tuple(state.rectangles),
+                state.effective_motion_correction,
+            )
             for path, state in self._analysis_states.items()
-            if state.rectangles
+            if state.rectangles and state.motion_ready
         )
         if not requests or self._peak_batch_running:
             return
@@ -1744,7 +3699,7 @@ class MainWindow(QMainWindow):
         self._peak_token += 1
         token = self._peak_token
         self._segmentation_token += 1
-        for path, _rectangles in requests:
+        for path, _rectangles, _correction in requests:
             state = self._analysis_states[path]
             state.peak_result = None
             state.peak_error = None
@@ -1754,12 +3709,16 @@ class MainWindow(QMainWindow):
             state.correction_undo.clear()
             state.correction_redo.clear()
             state.selected_pool_ids.clear()
+            state.area_result = None
+            state.area_error = None
             state.background_result = None
             state.corrected_background_labels = None
             state.background_assignments.clear()
             state.background_undo.clear()
             state.background_redo.clear()
             state.selected_background_id = None
+            state.trace_result = None
+            state.excluded_pool_reasons.clear()
 
         task = _FunctionTask(token, lambda: _detect_peak_batch(requests))
         task.signals.succeeded.connect(self._peak_detection_finished)
@@ -1772,7 +3731,9 @@ class MainWindow(QMainWindow):
         self.canvas.clear_backgrounds()
         self.find_peak_button.setEnabled(False)
         self.find_peak_button.setText("Calculating all recording peaks…")
-        region_count = sum(len(rectangles) for _path, rectangles in requests)
+        region_count = sum(
+            len(rectangles) for _path, rectangles, _correction in requests
+        )
         self.peak_summary_label.setText(
             f"One batch is scanning {len(requests)} recording(s) containing "
             f"{region_count} analysis region(s)…"
@@ -1788,7 +3749,10 @@ class MainWindow(QMainWindow):
             return
         self._peak_batch_running = False
         self.recording_list.setEnabled(True)
-        self.draw_region_action.setEnabled(self._metadata is not None)
+        state = self.current_analysis_state
+        self.draw_region_action.setEnabled(
+            self._metadata is not None and state is not None and state.motion_ready
+        )
         for path, peak_result in result.results.items():
             state = self._analysis_states.get(path)
             if state is not None:
@@ -1819,7 +3783,10 @@ class MainWindow(QMainWindow):
             return
         self._peak_batch_running = False
         self.recording_list.setEnabled(True)
-        self.draw_region_action.setEnabled(self._metadata is not None)
+        state = self.current_analysis_state
+        self.draw_region_action.setEnabled(
+            self._metadata is not None and state is not None and state.motion_ready
+        )
         self._update_peak_button_text()
         self._update_region_actions()
         self.peak_summary_label.setText("Peak calculation failed.")
@@ -1828,6 +3795,15 @@ class MainWindow(QMainWindow):
 
     def _show_peak_state(self) -> None:
         state = self.current_analysis_state
+        if state is not None and not state.motion_ready:
+            self.peak_summary_label.setText(
+                "Choose No correction or calculate and accept motion correction first."
+            )
+            self.override_peak_checkbox.setEnabled(False)
+            self.manual_peak_spin.setEnabled(False)
+            self.go_to_peak_button.setEnabled(False)
+            self._update_region_actions()
+            return
         if state is None or state.peak_result is None:
             self.peak_summary_label.setText(
                 "Add at least one rectangle."
@@ -2016,6 +3992,7 @@ class MainWindow(QMainWindow):
 
     def _invalidate_segmentation(self) -> None:
         self._segmentation_token += 1
+        self._area_token += 1
         self._background_token += 1
         state = self.current_analysis_state
         if state is not None:
@@ -2024,17 +4001,22 @@ class MainWindow(QMainWindow):
             state.correction_undo.clear()
             state.correction_redo.clear()
             state.selected_pool_ids.clear()
+            state.area_result = None
+            state.area_error = None
             state.background_result = None
             state.corrected_background_labels = None
             state.background_assignments.clear()
             state.background_undo.clear()
             state.background_redo.clear()
             state.selected_background_id = None
+            state.trace_result = None
+            state.excluded_pool_reasons.clear()
         if hasattr(self, "canvas"):
             self.canvas.clear_segmentation()
             self.canvas.clear_backgrounds()
         if hasattr(self, "segmentation_summary_label"):
             self._show_segmentation_state()
+            self._show_area_state()
 
     @Slot()
     def _start_segmentation(self) -> None:
@@ -2048,6 +4030,7 @@ class MainWindow(QMainWindow):
             return
         self._stop_playback()
         self._stop_all_drawing()
+        self._invalidate_area_analysis(state)
         self._invalidate_backgrounds()
         self._segmentation_token += 1
         token = self._segmentation_token
@@ -2055,9 +4038,12 @@ class MainWindow(QMainWindow):
         peak_index = state.effective_peak_index
         rectangles = tuple(state.rectangles)
         parameters = state.segmentation_parameters
+        correction = state.effective_motion_correction
         task = _FunctionTask(
             token,
-            lambda: segment_recording(path, peak_index, rectangles, parameters),
+            lambda: segment_recording(
+                path, peak_index, rectangles, parameters, correction
+            ),
         )
         task.signals.succeeded.connect(self._segmentation_finished)
         task.signals.failed.connect(self._segmentation_failed)
@@ -2083,14 +4069,19 @@ class MainWindow(QMainWindow):
         state.correction_undo.clear()
         state.correction_redo.clear()
         state.selected_pool_ids.clear()
+        state.area_result = None
+        state.area_error = None
         state.background_result = None
         state.corrected_background_labels = None
         state.background_assignments.clear()
         state.background_undo.clear()
         state.background_redo.clear()
         state.selected_background_id = None
+        state.trace_result = None
+        state.excluded_pool_reasons.clear()
         self.run_segmentation_button.setText("Rerun automatic segmentation")
         self._show_segmentation_state()
+        self._show_area_state()
         self._go_to_effective_peak()
         self.statusBar().showMessage(
             f"Automatic segmentation found {len(result.pools)} pool(s)"
@@ -2164,6 +4155,48 @@ class MainWindow(QMainWindow):
         if state.corrected_labels is None:
             state.corrected_labels = state.segmentation_result.labels.copy()
         return state.corrected_labels
+
+    @staticmethod
+    def _labels_for_state(
+        state: RecordingAnalysisState,
+    ) -> np.ndarray[Any, Any] | None:
+        if state.segmentation_result is None:
+            return None
+        return (
+            state.corrected_labels
+            if state.corrected_labels is not None
+            else state.segmentation_result.labels
+        )
+
+    @staticmethod
+    def _background_labels_for_state(
+        state: RecordingAnalysisState,
+    ) -> np.ndarray[Any, Any] | None:
+        if state.background_result is None:
+            return None
+        return (
+            state.corrected_background_labels
+            if state.corrected_background_labels is not None
+            else state.background_result.labels
+        )
+
+    @staticmethod
+    def _invalidate_trace_cache(
+        state: RecordingAnalysisState, *, pool_identities_changed: bool = False
+    ) -> None:
+        state.trace_result = None
+        if pool_identities_changed:
+            labels = MainWindow._labels_for_state(state)
+            existing = (
+                {int(value) for value in np.unique(labels) if value > 0}
+                if labels is not None
+                else set()
+            )
+            state.excluded_pool_reasons = {
+                pool_id: reason
+                for pool_id, reason in state.excluded_pool_reasons.items()
+                if pool_id in existing
+            }
 
     def _show_correction_state(self) -> None:
         if not hasattr(self, "pool_list"):
@@ -2333,7 +4366,11 @@ class MainWindow(QMainWindow):
                 rectangle = self._rectangle_for_hint(geometry)
                 if self._current_path is None or state.effective_peak_index is None:
                     return
-                frame = read_frame(self._current_path, state.effective_peak_index)
+                frame = read_frame(
+                    self._current_path,
+                    state.effective_peak_index,
+                    state.effective_motion_correction,
+                )
                 mask = guided_pool_mask(
                     frame, geometry, rectangle, state.segmentation_parameters
                 )
@@ -2412,6 +4449,8 @@ class MainWindow(QMainWindow):
         state.correction_redo.clear()
         existing = {int(value) for value in np.unique(corrected) if value > 0}
         state.selected_pool_ids.intersection_update(existing)
+        self._invalidate_trace_cache(state, pool_identities_changed=True)
+        self._invalidate_area_analysis(state)
         self._invalidate_backgrounds()
         self._show_segmentation_state()
         self.statusBar().showMessage(description)
@@ -2452,6 +4491,8 @@ class MainWindow(QMainWindow):
         edit.apply(labels, undo=True)
         state.correction_redo.append(edit)
         state.selected_pool_ids.clear()
+        self._invalidate_trace_cache(state, pool_identities_changed=True)
+        self._invalidate_area_analysis(state)
         self._invalidate_backgrounds()
         self._show_segmentation_state()
         self.statusBar().showMessage(f"Undid: {edit.description}")
@@ -2466,6 +4507,8 @@ class MainWindow(QMainWindow):
         edit.apply(labels)
         state.correction_undo.append(edit)
         state.selected_pool_ids.clear()
+        self._invalidate_trace_cache(state, pool_identities_changed=True)
+        self._invalidate_area_analysis(state)
         self._invalidate_backgrounds()
         self._show_segmentation_state()
         self.statusBar().showMessage(f"Redid: {edit.description}")
@@ -2480,6 +4523,165 @@ class MainWindow(QMainWindow):
             state.segmentation_result.labels.copy(), "Reset to automatic segmentation"
         )
 
+    def _invalidate_area_analysis(
+        self, state: RecordingAnalysisState | None = None
+    ) -> None:
+        self._area_token += 1
+        target = state or self.current_analysis_state
+        if target is not None:
+            target.area_result = None
+            target.area_error = None
+        if hasattr(self, "area_summary_label"):
+            self._show_area_state()
+
+    def _show_area_state(self) -> None:
+        if not hasattr(self, "calculate_areas_button"):
+            return
+        state = self.current_analysis_state
+        labels = self._current_labels()
+        can_calculate = (
+            state is not None
+            and labels is not None
+            and np.any(labels)
+            and state.effective_peak_index is not None
+            and not self._area_running
+        )
+        self.calculate_areas_button.setEnabled(can_calculate)
+        has_result = state is not None and state.area_result is not None
+        self.review_areas_button.setEnabled(has_result and not self._area_running)
+        if self._area_running:
+            return
+        if state is None or labels is None or not np.any(labels):
+            message = "Finish pool segmentation before calculating areas."
+        elif state.area_error:
+            message = f"Area calculation failed: {state.area_error}"
+        elif state.area_result is None:
+            message = (
+                "Ready to calculate peak-mask areas and independently detected "
+                "pixels for every frame."
+            )
+        else:
+            result = state.area_result
+            message = (
+                f"Calculated {len(result.frame_numbers)} frame(s) for "
+                f"{len(result.pool_ids)} pool(s); {result.warning_count} pool-frame "
+                "QC warning(s). Mask review is optional."
+            )
+        self.area_summary_label.setText(message)
+        self._show_export_state()
+
+    @Slot()
+    def _start_area_analysis(self) -> None:
+        state = self.current_analysis_state
+        labels = self._current_labels()
+        if (
+            self._current_path is None
+            or state is None
+            or labels is None
+            or state.effective_peak_index is None
+            or self._area_running
+        ):
+            return
+        self._stop_playback()
+        self._stop_all_drawing()
+        self._area_token += 1
+        token = self._area_token
+        path = self._current_path
+        state.area_result = None
+        state.area_error = None
+        task = _AreaTask(
+            token,
+            path,
+            np.asarray(labels, dtype=np.int32).copy(),
+            tuple(state.rectangles),
+            state.effective_peak_index,
+            state.segmentation_parameters,
+            state.effective_motion_correction,
+        )
+        task.signals.succeeded.connect(self._area_analysis_finished)
+        task.signals.failed.connect(self._area_analysis_failed)
+        task.signals.progress.connect(self._area_analysis_progress)
+        self._area_running = True
+        self._area_path = path
+        self.recording_list.setEnabled(False)
+        self.open_file_action.setEnabled(False)
+        self.open_folder_action.setEnabled(False)
+        self.analysis_controls.setEnabled(False)
+        self.calculate_areas_button.setEnabled(False)
+        self.review_areas_button.setEnabled(False)
+        self.area_summary_label.setText("Calculating pool areas…")
+        self.statusBar().showMessage(f"Calculating pool areas for {path.name}")
+        self._analysis_thread_pool.start(task)
+
+    @Slot(int, int, int)
+    def _area_analysis_progress(self, token: int, frame: int, total: int) -> None:
+        if token != self._area_token or not self._area_running:
+            return
+        message = f"Calculating pool areas: frame {frame}/{total}"
+        self.area_summary_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    @Slot(int, object)
+    def _area_analysis_finished(self, token: int, payload: object) -> None:
+        if token != self._area_token or not isinstance(payload, AreaAnalysisResult):
+            return
+        path = self._area_path
+        self._area_running = False
+        self._area_path = None
+        self.recording_list.setEnabled(True)
+        self.open_file_action.setEnabled(True)
+        self.open_folder_action.setEnabled(True)
+        self.analysis_controls.setEnabled(True)
+        state = self._analysis_states.get(path) if path is not None else None
+        if state is not None:
+            state.area_result = payload
+            state.area_error = None
+        self._show_area_state()
+        self.statusBar().showMessage(
+            f"Pool areas calculated with {payload.warning_count} QC warning(s)"
+        )
+
+    @Slot(int, str)
+    def _area_analysis_failed(self, token: int, message: str) -> None:
+        if token != self._area_token:
+            return
+        path = self._area_path
+        self._area_running = False
+        self._area_path = None
+        self.recording_list.setEnabled(True)
+        self.open_file_action.setEnabled(True)
+        self.open_folder_action.setEnabled(True)
+        self.analysis_controls.setEnabled(True)
+        state = self._analysis_states.get(path) if path is not None else None
+        if state is not None:
+            state.area_error = message
+        self._show_area_state()
+        self.statusBar().showMessage("Pool area calculation failed")
+        self._show_error("Could not calculate pool areas", message)
+
+    @Slot()
+    def _review_area_masks(self) -> None:
+        state = self.current_analysis_state
+        labels = self._current_labels()
+        if (
+            self._current_path is None
+            or self._metadata is None
+            or state is None
+            or labels is None
+            or state.area_result is None
+        ):
+            return
+        dialog = AreaMaskReviewDialog(
+            self._current_path,
+            self._metadata,
+            state.effective_motion_correction,
+            labels,
+            tuple(state.rectangles),
+            state.area_result,
+            self,
+        )
+        dialog.exec()
+
     def _invalidate_backgrounds(self) -> None:
         self._background_token += 1
         self._remove_background_move_roi()
@@ -2491,6 +4693,7 @@ class MainWindow(QMainWindow):
             state.selected_background_id = None
             state.background_undo.clear()
             state.background_redo.clear()
+            self._invalidate_trace_cache(state)
         if hasattr(self, "canvas"):
             self.canvas.clear_backgrounds()
         if hasattr(self, "background_summary_label"):
@@ -2516,11 +4719,17 @@ class MainWindow(QMainWindow):
         peak_index = state.effective_peak_index
         rectangles = tuple(state.rectangles)
         parameters = state.background_parameters
+        correction = state.effective_motion_correction
         pools_snapshot = np.asarray(pool_labels, dtype=np.int32).copy()
         task = _FunctionTask(
             token,
             lambda: find_recording_backgrounds(
-                path, peak_index, pools_snapshot, rectangles, parameters
+                path,
+                peak_index,
+                pools_snapshot,
+                rectangles,
+                parameters,
+                correction,
             ),
         )
         task.signals.succeeded.connect(self._background_detection_finished)
@@ -2549,6 +4758,7 @@ class MainWindow(QMainWindow):
         state.selected_background_id = None
         state.background_undo.clear()
         state.background_redo.clear()
+        self._invalidate_trace_cache(state)
         if result.missing_pool_ids:
             state.selected_pool_ids = {result.missing_pool_ids[0]}
         self._show_correction_state()
@@ -3036,6 +5246,7 @@ class MainWindow(QMainWindow):
         state.background_assignments = dict(assignments)
         state.background_undo.append(edit)
         state.background_redo.clear()
+        self._invalidate_trace_cache(state)
         self._show_correction_state()
         self._show_background_state()
         self.statusBar().showMessage(description)
@@ -3051,6 +5262,7 @@ class MainWindow(QMainWindow):
         state.background_assignments = dict(edit.before_assignments)
         state.background_redo.append(edit)
         state.selected_background_id = None
+        self._invalidate_trace_cache(state)
         self._show_correction_state()
         self._show_background_state()
         self.statusBar().showMessage(f"Undid: {edit.description}")
@@ -3066,6 +5278,7 @@ class MainWindow(QMainWindow):
         state.background_assignments = dict(edit.after_assignments)
         state.background_undo.append(edit)
         state.selected_background_id = None
+        self._invalidate_trace_cache(state)
         self._show_correction_state()
         self._show_background_state()
         self.statusBar().showMessage(f"Redid: {edit.description}")
@@ -3084,57 +5297,180 @@ class MainWindow(QMainWindow):
             state.background_result.labels.copy(), assignments, "Reset backgrounds"
         )
 
-    def _export_readiness(self) -> tuple[bool, str]:
-        state = self.current_analysis_state
-        metadata = self.current_metadata
-        if state is None or metadata is None or self._current_path is None:
-            return False, "Open a recording before exporting."
+    def _recording_paths(self) -> tuple[Path, ...]:
+        return tuple(
+            Path(self.recording_list.item(row).data(Qt.ItemDataRole.UserRole)).resolve()
+            for row in range(self.recording_list.count())
+        )
+
+    def _trace_readiness_for(self, path: Path) -> tuple[bool, str]:
+        state = self._analysis_states.get(path)
+        if state is None:
+            return False, "Recording analysis state is unavailable."
+        if not state.motion_ready:
+            return False, "Motion correction has not been chosen and accepted."
         if state.peak_result is None or state.effective_peak_index is None:
-            return False, "Calculate the recording peak before exporting."
-        pool_labels = self._current_labels()
+            return False, "The recording peak has not been calculated."
+        pool_labels = self._labels_for_state(state)
         if pool_labels is None or not np.any(pool_labels):
-            return False, "Complete pool segmentation before exporting."
-        background_labels = self._current_background_labels()
+            return False, "Pool segmentation is incomplete."
+        background_labels = self._background_labels_for_state(state)
         if background_labels is None or not np.any(background_labels):
-            return False, "Find or draw the required background region(s)."
+            return False, "Required background regions are incomplete."
         missing = self._missing_background_pool_ids(state, pool_labels)
         if missing:
-            return (
-                False,
-                f"Place backgrounds for {len(missing)} red-highlighted pool(s) first.",
-            )
+            return False, f"{len(missing)} pool-wise background(s) are missing."
+        return True, "Ready for trace review."
+
+    def _export_readiness_for(self, path: Path) -> tuple[bool, str]:
+        state = self._analysis_states.get(path)
+        trace_ready, message = self._trace_readiness_for(path)
+        if not trace_ready or state is None:
+            return False, message
+        pool_labels = self._labels_for_state(state)
+        pool_ids = (
+            {int(value) for value in np.unique(pool_labels) if value > 0}
+            if pool_labels is not None
+            else set()
+        )
+        if pool_ids and pool_ids.issubset(state.excluded_pool_reasons):
+            return False, "Every accepted pool is excluded from export."
+        if state.area_result is None:
+            return False, "Pool areas have not been calculated."
+        return True, "Ready to export."
+
+    def _export_readiness(self) -> tuple[bool, str]:
+        metadata = self.current_metadata
+        if metadata is None or self._current_path is None:
+            return False, "Open a recording before exporting."
+        ready, message = self._export_readiness_for(self._current_path)
+        if not ready:
+            return False, message
         return True, (
-            "Ready to export raw traces, ImageJ ROIs, and the display LUT using "
-            "ND2 timestamps."
+            "Ready to review/export raw and normalized traces, ImageJ ROIs, areas, "
+            "and the display LUT using ND2 timestamps."
             if metadata.timestamps_s is not None
             else "Ready to export; the app will ask for the frame interval."
         )
+
+    @Slot(bool)
+    def _open_trace_review(self, all_recordings: bool = False) -> None:
+        if self._export_running:
+            return
+        paths = (
+            self._recording_paths()
+            if all_recordings
+            else ((self._current_path,) if self._current_path is not None else ())
+        )
+        items: list[_TraceReviewItem] = []
+        unreadable: list[str] = []
+        for path in paths:
+            if path is None:
+                continue
+            try:
+                metadata = (
+                    self._metadata
+                    if path == self._current_path and self._metadata is not None
+                    else read_metadata(path)
+                )
+            except Exception as error:  # noqa: BLE001 - report all unreadable files
+                unreadable.append(f"{path.name}: {type(error).__name__}: {error}")
+                continue
+            state = self._analysis_states[path]
+            trace_ready, trace_message = self._trace_readiness_for(path)
+            export_ready, export_message = self._export_readiness_for(path)
+            items.append(
+                _TraceReviewItem(
+                    path=path,
+                    metadata=metadata,
+                    state=state,
+                    pool_labels=(
+                        None
+                        if self._labels_for_state(state) is None
+                        else np.asarray(
+                            self._labels_for_state(state), dtype=np.int32
+                        ).copy()
+                    ),
+                    background_labels=(
+                        None
+                        if self._background_labels_for_state(state) is None
+                        else np.asarray(
+                            self._background_labels_for_state(state), dtype=np.int32
+                        ).copy()
+                    ),
+                    trace_readiness_error=None if trace_ready else trace_message,
+                    export_readiness_error=None if export_ready else export_message,
+                )
+            )
+        if unreadable:
+            QMessageBox.warning(
+                self,
+                "Some recordings could not be read",
+                "These recordings were ignored:\n" + "\n".join(unreadable),
+            )
+        if not items:
+            QMessageBox.warning(
+                self, "Nothing to review", "No recording could be loaded."
+            )
+            return
+        dialog = TraceReviewDialog(
+            tuple(items), allow_batch_export=all_recordings, parent=self
+        )
+        if (
+            dialog.exec() == QDialog.DialogCode.Accepted
+            and dialog.requested_export_paths
+        ):
+            if len(dialog.requested_export_paths) == 1:
+                self._start_analysis_export_for_path(dialog.requested_export_paths[0])
+            else:
+                self._start_batch_analysis_export(dialog.requested_export_paths)
+        self._show_export_state()
 
     def _show_export_state(self) -> None:
         if not hasattr(self, "export_analysis_button"):
             return
         ready, message = self._export_readiness()
         self.export_analysis_button.setEnabled(ready and not self._export_running)
+        self.review_current_traces_button.setEnabled(
+            self._current_path is not None and not self._export_running
+        )
+        self.review_all_traces_button.setEnabled(
+            self.recording_list.count() > 0 and not self._export_running
+        )
         if not self._export_running:
             self.export_analysis_button.setText("Export current recording…")
             self.export_summary_label.setText(message)
 
     @Slot()
     def _start_analysis_export(self) -> None:
-        ready, message = self._export_readiness()
+        if self._current_path is not None:
+            self._start_analysis_export_for_path(self._current_path)
+
+    def _start_analysis_export_for_path(self, path: Path) -> None:
+        ready, message = self._export_readiness_for(path)
         if not ready:
             QMessageBox.warning(self, "Recording is not ready to export", message)
             return
-        state = self.current_analysis_state
-        metadata = self.current_metadata
-        pool_labels = self._current_labels()
-        background_labels = self._current_background_labels()
+        state = self._analysis_states.get(path)
+        try:
+            metadata = (
+                self.current_metadata
+                if path == self._current_path and self.current_metadata is not None
+                else read_metadata(path)
+            )
+        except Exception as error:  # noqa: BLE001
+            self._show_error("Could not read recording metadata", str(error))
+            return
+        pool_labels = None if state is None else self._labels_for_state(state)
+        background_labels = (
+            None if state is None else self._background_labels_for_state(state)
+        )
         if (
             state is None
             or metadata is None
-            or self._current_path is None
             or state.peak_result is None
             or state.segmentation_result is None
+            or state.area_result is None
             or state.background_result is None
             or state.effective_peak_index is None
             or pool_labels is None
@@ -3166,7 +5502,7 @@ class MainWindow(QMainWindow):
                     return
                 uniform_interval_s = None
 
-        initial_directory = self._last_export_directory or self._current_path.parent
+        initial_directory = self._last_export_directory or path.parent
         selected_directory = QFileDialog.getExistingDirectory(
             self,
             "Choose export folder",
@@ -3177,9 +5513,10 @@ class MainWindow(QMainWindow):
         output_directory = Path(selected_directory).resolve()
         self._last_export_directory = output_directory
         output_paths = (
-            output_directory / f"{self._current_path.stem}_analysis.xlsx",
-            output_directory / f"{self._current_path.stem}_rois.zip",
-            output_directory / f"{self._current_path.stem}_display.lut",
+            output_directory / f"{path.stem}_analysis.xlsx",
+            output_directory / f"{path.stem}_rois.zip",
+            output_directory / f"{path.stem}_display.lut",
+            output_directory / f"{path.stem}_manifest.json",
         )
         conflicts = tuple(path for path in output_paths if path.exists())
         overwrite = False
@@ -3197,7 +5534,7 @@ class MainWindow(QMainWindow):
             overwrite = True
 
         request = AnalysisExportRequest(
-            source_path=self._current_path,
+            source_path=path,
             output_directory=output_directory,
             metadata=metadata,
             rectangles=tuple(state.rectangles),
@@ -3210,12 +5547,20 @@ class MainWindow(QMainWindow):
             background_labels=np.asarray(background_labels, dtype=np.int32).copy(),
             automatic_background_labels=state.background_result.labels.copy(),
             background_assignments=dict(state.background_assignments),
+            area_result=state.area_result,
             display_lut=self.canvas.display_lut(),
             display_levels=(
                 self.canvas.display_levels
                 if self.canvas.display_levels is not None
                 else (0.0, 1.0)
             ),
+            included_pool_ids=tuple(
+                int(value)
+                for value in np.unique(pool_labels)
+                if value > 0 and int(value) not in state.excluded_pool_reasons
+            ),
+            exclusion_reasons=dict(state.excluded_pool_reasons),
+            motion_correction=state.effective_motion_correction,
             uniform_interval_s=uniform_interval_s,
             overwrite=overwrite,
         )
@@ -3226,11 +5571,187 @@ class MainWindow(QMainWindow):
         task.signals.succeeded.connect(self._analysis_export_finished)
         task.signals.failed.connect(self._analysis_export_failed)
         self._set_export_running(True)
+        self._batch_skipped_count = 0
         self.export_analysis_button.setText("Extracting traces and exporting…")
         self.export_summary_label.setText(
             "Streaming raw frames and writing the XLSX, ROI ZIP, and display LUT…"
         )
-        self.statusBar().showMessage(f"Exporting {self._current_path.name}")
+        self.statusBar().showMessage(f"Exporting {path.name}")
+        self._analysis_thread_pool.start(task)
+
+    def _start_batch_analysis_export(self, paths: tuple[Path, ...]) -> None:
+        ready_paths: list[Path] = []
+        skipped: list[str] = []
+        for path in paths:
+            ready, reason = self._export_readiness_for(path)
+            if ready:
+                ready_paths.append(path)
+            else:
+                skipped.append(f"{path.name}: {reason}")
+        if not ready_paths:
+            QMessageBox.warning(
+                self,
+                "No recordings are ready",
+                "Every selected recording was incomplete and has been ignored.",
+            )
+            return
+
+        metadata_by_path: dict[Path, RecordingMetadata] = {}
+        intervals: dict[Path, float | None] = {}
+        for path in ready_paths:
+            try:
+                metadata = (
+                    self.current_metadata
+                    if path == self._current_path and self.current_metadata is not None
+                    else read_metadata(path)
+                )
+            except Exception as error:  # noqa: BLE001
+                skipped.append(f"{path.name}: metadata could not be read ({error})")
+                continue
+            metadata_by_path[path] = metadata
+            intervals[path] = None
+            if metadata.timestamps_s is None:
+                interval, provided = QInputDialog.getDouble(
+                    self,
+                    f"Frame interval needed — {path.name}",
+                    "Seconds per frame:",
+                    1.0,
+                    0.000001,
+                    1000000.0,
+                    6,
+                )
+                if provided:
+                    intervals[path] = interval
+                else:
+                    use_frames = QMessageBox.question(
+                        self,
+                        "Use frame numbers?",
+                        f"No interval was provided for {path.name}. Continue with "
+                        "one-based frame numbers and no seconds column?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                    if use_frames != QMessageBox.StandardButton.Yes:
+                        skipped.append(f"{path.name}: no time information provided")
+                        metadata_by_path.pop(path, None)
+        ready_paths = [path for path in ready_paths if path in metadata_by_path]
+        if not ready_paths:
+            QMessageBox.warning(
+                self,
+                "No recordings are ready",
+                "The selected recordings were ignored because required metadata "
+                "or time information was unavailable.",
+            )
+            return
+
+        initial_directory = self._last_export_directory or ready_paths[0].parent
+        selected_directory = QFileDialog.getExistingDirectory(
+            self, "Choose batch export folder", str(initial_directory)
+        )
+        if not selected_directory:
+            return
+        output_directory = Path(selected_directory).resolve()
+        self._last_export_directory = output_directory
+        conflicts = tuple(
+            output_directory / f"{path.stem}{suffix}"
+            for path in ready_paths
+            for suffix in (
+                "_analysis.xlsx",
+                "_rois.zip",
+                "_display.lut",
+                "_manifest.json",
+            )
+            if (output_directory / f"{path.stem}{suffix}").exists()
+        )
+        overwrite = False
+        if conflicts:
+            visible = "\n".join(path.name for path in conflicts[:12])
+            if len(conflicts) > 12:
+                visible += f"\n…and {len(conflicts) - 12} more"
+            answer = QMessageBox.question(
+                self,
+                "Replace existing export files?",
+                f"These files already exist:\n{visible}\n\nReplace them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            overwrite = True
+
+        display_lut = self.canvas.display_lut()
+        display_levels = self.canvas.display_levels or (0.0, 1.0)
+        requests: list[AnalysisExportRequest] = []
+        for path in ready_paths:
+            state = self._analysis_states[path]
+            pool_labels = self._labels_for_state(state)
+            background_labels = self._background_labels_for_state(state)
+            if (
+                pool_labels is None
+                or background_labels is None
+                or state.peak_result is None
+                or state.segmentation_result is None
+                or state.background_result is None
+                or state.area_result is None
+                or state.effective_peak_index is None
+            ):
+                skipped.append(f"{path.name}: analysis became incomplete")
+                continue
+            requests.append(
+                AnalysisExportRequest(
+                    source_path=path,
+                    output_directory=output_directory,
+                    metadata=metadata_by_path[path],
+                    rectangles=tuple(state.rectangles),
+                    peak_result=state.peak_result,
+                    effective_peak_index=state.effective_peak_index,
+                    segmentation_parameters=state.segmentation_parameters,
+                    background_parameters=state.background_parameters,
+                    pool_labels=np.asarray(pool_labels, dtype=np.int32).copy(),
+                    automatic_pool_labels=state.segmentation_result.labels.copy(),
+                    background_labels=np.asarray(
+                        background_labels, dtype=np.int32
+                    ).copy(),
+                    automatic_background_labels=state.background_result.labels.copy(),
+                    background_assignments=dict(state.background_assignments),
+                    area_result=state.area_result,
+                    display_lut=display_lut.copy(),
+                    display_levels=display_levels,
+                    included_pool_ids=tuple(
+                        int(value)
+                        for value in np.unique(pool_labels)
+                        if value > 0 and int(value) not in state.excluded_pool_reasons
+                    ),
+                    exclusion_reasons=dict(state.excluded_pool_reasons),
+                    motion_correction=state.effective_motion_correction,
+                    uniform_interval_s=intervals[path],
+                    overwrite=overwrite,
+                )
+            )
+        if not requests:
+            QMessageBox.warning(
+                self, "Nothing to export", "No ready recording remains."
+            )
+            return
+
+        self._stop_all_drawing()
+        self._export_token += 1
+        token = self._export_token
+        task = _FunctionTask(token, lambda: _export_analysis_batch(tuple(requests)))
+        task.signals.succeeded.connect(self._analysis_export_finished)
+        task.signals.failed.connect(self._analysis_export_failed)
+        self._set_export_running(True)
+        self._batch_skipped_count = len(skipped)
+        self.export_analysis_button.setText("Batch export running…")
+        ignored_text = (
+            f"; {len(skipped)} incomplete recording(s) ignored" if skipped else ""
+        )
+        self.export_summary_label.setText(
+            f"Exporting {len(requests)} ready recording(s){ignored_text}…"
+        )
+        self.statusBar().showMessage(
+            f"Batch export: {len(requests)} ready, {len(skipped)} ignored"
+        )
         self._analysis_thread_pool.start(task)
 
     def _set_export_running(self, running: bool) -> None:
@@ -3243,7 +5764,34 @@ class MainWindow(QMainWindow):
 
     @Slot(int, object)
     def _analysis_export_finished(self, token: int, result: object) -> None:
-        if token != self._export_token or not isinstance(result, AnalysisExportResult):
+        if token != self._export_token:
+            return
+        if isinstance(result, _AnalysisBatchExportResult):
+            self._set_export_running(False)
+            self._show_background_state()
+            success_count = len(result.results)
+            failure_count = len(result.failures)
+            self.export_summary_label.setText(
+                f"Batch export finished: {success_count} recording(s) exported; "
+                f"{self._batch_skipped_count} incomplete recording(s) ignored; "
+                f"{failure_count} failed."
+            )
+            self.statusBar().showMessage(
+                f"Batch export: {success_count} exported, "
+                f"{self._batch_skipped_count} ignored, {failure_count} failed"
+            )
+            details = "\n".join(
+                f"{path.name}: {message}" for path, message in result.failures.items()
+            )
+            QMessageBox.information(
+                self,
+                "Batch export complete",
+                f"Exported {success_count} recording(s); ignored "
+                f"{self._batch_skipped_count} incomplete recording(s)."
+                + (f"\n\nFailures:\n{details}" if details else ""),
+            )
+            return
+        if not isinstance(result, AnalysisExportResult):
             return
         self._set_export_running(False)
         self._show_background_state()
@@ -3256,7 +5804,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Export complete",
-            f"Saved:\n{result.workbook_path}\n{result.roi_zip_path}\n{result.lut_path}",
+            f"Saved:\n{result.workbook_path}\n{result.roi_zip_path}\n"
+            f"{result.lut_path}\n{result.manifest_path}",
         )
 
     @Slot(int, str)
@@ -3272,6 +5821,13 @@ class MainWindow(QMainWindow):
     def _clear_analysis_controls(self) -> None:
         self._stop_correction_drawing()
         self._clear_region_items()
+        self.motion_mode_combo.setEnabled(False)
+        self.calculate_motion_button.setEnabled(False)
+        self.calculate_all_motion_button.setEnabled(False)
+        self.review_motion_button.setEnabled(False)
+        self.save_corrected_button.setEnabled(False)
+        self.save_corrected_button.setText("Save corrected images…")
+        self.motion_summary_label.setText("Loading recording…")
         self.find_peak_button.setEnabled(False)
         self._update_peak_button_text()
         self.peak_summary_label.setText("Loading recording…")
@@ -3306,6 +5862,12 @@ class MainWindow(QMainWindow):
         self.correction_summary_label.setText(
             "Run automatic segmentation before making corrections."
         )
+        self.calculate_areas_button.setEnabled(False)
+        self.calculate_areas_button.setText("Calculate areas")
+        self.review_areas_button.setEnabled(False)
+        self.area_summary_label.setText(
+            "Finish pool segmentation before calculating areas."
+        )
         self._set_missing_background_pools(())
         self.background_list.blockSignals(True)
         self.background_list.clear()
@@ -3329,6 +5891,8 @@ class MainWindow(QMainWindow):
             "Finish pool segmentation before finding backgrounds."
         )
         self.export_analysis_button.setEnabled(False)
+        self.review_current_traces_button.setEnabled(False)
+        self.review_all_traces_button.setEnabled(self.recording_list.count() > 0)
         self.export_summary_label.setText(
             "Complete pool segmentation and background selection before exporting."
         )
@@ -3339,12 +5903,17 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, title, message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._export_running:
+        if (
+            self._export_running
+            or self._corrected_export_running
+            or self._motion_running
+            or self._area_running
+        ):
             QMessageBox.information(
                 self,
-                "Export in progress",
-                "Please wait for the current trace and ROI export to finish before "
-                "closing the application.",
+                "Analysis in progress",
+                "Please wait for the current motion, area calculation, or export to "
+                "finish before closing the application.",
             )
             event.ignore()
             return
@@ -3352,8 +5921,11 @@ class MainWindow(QMainWindow):
         self._stop_all_drawing()
         self._metadata_token += 1
         self._frame_token += 1
+        self._motion_token += 1
+        self._corrected_export_token += 1
         self._peak_token += 1
         self._segmentation_token += 1
+        self._area_token += 1
         self._background_token += 1
         self._export_token += 1
         self._remove_background_move_roi()
