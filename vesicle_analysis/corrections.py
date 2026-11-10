@@ -7,13 +7,12 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
 from skimage.draw import ellipse, line, polygon
-from skimage.feature import peak_local_max
 from skimage.filters import gaussian
 from skimage.morphology import dilation, disk
 from skimage.segmentation import watershed
 
 from vesicle_analysis.analysis import RectangleBounds
-from vesicle_analysis.segmentation import SegmentationParameters
+from vesicle_analysis.segmentation import SegmentationParameters, find_seed_coordinates
 
 
 class LabelOverlapError(ValueError):
@@ -91,6 +90,7 @@ def apply_shape(
     *,
     replace_ids: tuple[int, ...] = (),
     allow_overwrite: bool = False,
+    new_pool_id: int | None = None,
 ) -> NDArray[np.int32]:
     if labels.shape != mask.shape:
         raise ValueError("The new boundary does not match the label-mask shape.")
@@ -109,7 +109,9 @@ def apply_shape(
         corrected[np.isin(corrected, tuple(replace))] = 0
         target_id = min(replace)
     else:
-        target_id = int(corrected.max()) + 1
+        target_id = new_pool_id or int(corrected.max()) + 1
+        if target_id <= 0 or np.any(corrected == target_id):
+            raise ValueError("The new pool identifier is already in use.")
     corrected[mask] = target_id
     return corrected
 
@@ -130,6 +132,78 @@ def merge_pools(
         raise ValueError("Select at least two pools to merge.")
     corrected = labels.copy()
     corrected[np.isin(corrected, selected)] = selected[0]
+    return corrected
+
+
+def apply_split_group_decision(
+    labels: NDArray[np.int32],
+    candidate_labels: NDArray[np.int32],
+    pool_ids: tuple[int, ...],
+    parent_pool_id: int,
+    valid_pool_ids: frozenset[int] | set[int],
+    *,
+    merged: bool,
+) -> NDArray[np.int32]:
+    """Apply independent validity and split decisions to one automatic group."""
+    if labels.shape != candidate_labels.shape:
+        raise ValueError("Candidate and accepted masks must have matching shapes.")
+    members = tuple(sorted({int(value) for value in pool_ids if value > 0}))
+    if parent_pool_id not in members:
+        raise ValueError("The split parent must be a member of its group.")
+    group_mask = np.isin(candidate_labels, members)
+    if not np.any(group_mask):
+        raise ValueError("The automatic split group contains no pixels.")
+
+    occupied = labels[group_mask]
+    conflicts = (occupied > 0) & ~np.isin(occupied, members)
+    if np.any(conflicts):
+        conflict_ids = sorted({int(value) for value in occupied[conflicts]})
+        joined = ", ".join(str(value) for value in conflict_ids)
+        raise LabelOverlapError(
+            f"A manual pool ({joined}) now occupies part of this split group."
+        )
+
+    corrected = labels.copy()
+    corrected[group_mask] = 0
+    valid_members = tuple(value for value in members if value in valid_pool_ids)
+    if not valid_members:
+        return corrected
+    valid_mask = np.isin(candidate_labels, valid_members)
+    if not merged:
+        corrected[valid_mask] = candidate_labels[valid_mask]
+        return corrected
+
+    components, count = ndimage.label(
+        valid_mask, structure=np.ones((3, 3), dtype=np.uint8)
+    )
+    group_y, group_x = np.nonzero(group_mask)
+    original_centroid = (float(group_y.mean()), float(group_x.mean()))
+    distances: list[float] = []
+    for component_id in range(1, count + 1):
+        yy, xx = np.nonzero(components == component_id)
+        pixel_distances = (
+            (yy.astype(np.float64) - original_centroid[0]) ** 2
+            + (xx.astype(np.float64) - original_centroid[1]) ** 2
+        )
+        distances.append(float(pixel_distances.min()))
+    preferred_component = int(np.argmin(distances)) + 1
+
+    for component_id in range(1, count + 1):
+        component = components == component_id
+        if component_id == preferred_component:
+            assigned_id = parent_pool_id
+        else:
+            overlapping_members = sorted(
+                {
+                    int(value)
+                    for value in np.unique(candidate_labels[component])
+                    if value in valid_members and value != parent_pool_id
+                }
+            )
+            if not overlapping_members:
+                continue
+            assigned_id = overlapping_members[0]
+        corrected[component] = assigned_id
     return corrected
 
 
@@ -164,6 +238,7 @@ def split_pool_with_line(
     labels: NDArray[np.int32],
     pool_id: int,
     points: tuple[tuple[float, float], ...],
+    next_pool_id: int | None = None,
 ) -> NDArray[np.int32]:
     original = labels == pool_id
     if not np.any(original):
@@ -189,7 +264,9 @@ def split_pool_with_line(
     )
     corrected = labels.copy()
     corrected[original] = 0
-    next_id = int(labels.max()) + 1
+    next_id = next_pool_id or int(labels.max()) + 1
+    if next_id <= 0 or np.any(labels == next_id):
+        raise ValueError("The next split-pool identifier is already in use.")
     for index, component_id in enumerate(ordered):
         assigned_id = pool_id if index == 0 else next_id
         corrected[divided == component_id] = assigned_id
@@ -240,18 +317,16 @@ def guided_pool_mask(
     forced = hint_coordinates[len(hint_coordinates) // 2]
     markers[tuple(forced)] = 1
 
-    automatic_seeds = peak_local_max(
+    automatic_seeds = find_seed_coordinates(
         enhanced,
-        min_distance=parameters.minimum_seed_distance,
-        threshold_abs=median + parameters.seed_threshold_sigma * noise,
-        labels=foreground,
-        exclude_border=False,
+        foreground,
+        median,
+        noise,
+        parameters,
     )
     next_marker = 2
     for seed in automatic_seeds:
-        if np.min(np.sum((hint_coordinates - seed) ** 2, axis=1)) <= (
-            parameters.minimum_seed_distance**2
-        ):
+        if np.min(np.sum((hint_coordinates - seed) ** 2, axis=1)) <= 1:
             continue
         markers[tuple(seed)] = next_marker
         next_marker += 1

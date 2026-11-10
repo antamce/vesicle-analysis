@@ -107,9 +107,36 @@ counted only once. An optional manual peak override is available.
 ### Segment vesicle pools
 
 Click **Run automatic segmentation** to detect bright vesicle pools on the
-effective peak frame. Advanced settings provide controls for detection
-threshold, accepted area, and seed separation. The coloured overlay can be
-shown or hidden while comparing it with the raw image.
+effective peak frame. The **Basic** tab controls the detection threshold. The
+**Advanced filtering** tab controls peak prominence, absolute area limits,
+per-metric outlier filtering, optional absolute cutoffs, and the population
+baseline. The default baseline is the median with scaled MAD; mean/standard
+deviation and manual-threshold-only modes are also available.
+
+The exact current detection formulas, defaults, quality rules, identifier
+behavior, and review procedure are recorded in
+[Current Vesicle-Pool Segmentation Protocol](SEGMENTATION_PROTOCOL.md).
+
+The accepted segmentation, pool-ID, valid/invalid review, and automatic-split
+review overlays have synchronized switches in the top toolbar and side panel.
+IDs are placed at mask centroids; crowded labels are moved with leader lines,
+and very dense groups remain hidden until the view is zoomed in.
+
+Quality filtering is calculated independently in each analysis rectangle from
+area, circularity, solidity, local contrast, and within-object intensity
+variation. Population filtering is skipped when a rectangle contains fewer
+than five candidates. Every detected candidate retains its stable ID and mask
+for optional review. **Review valid/invalid results** shows valid candidates in
+green and invalid candidates in a reason-specific colour; clicking toggles only
+that candidate's validity. **Review automatic splits** independently toggles a
+whole proposed group between split and merged. Invalid children are excluded
+from a merged result, and disconnected valid regions remain separate pools.
+
+Only one review mode can receive clicks at a time. Starting either review turns
+off **Show accepted segmentation results** and turns on the relevant review
+overlay; ending review restores all previous overlay settings. Both kinds of
+decisions share the normal undo/redo history. Rerunning segmentation resets
+the review decisions from the newly calculated candidates.
 
 Automatic results can be corrected with the following tools:
 

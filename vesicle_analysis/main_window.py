@@ -10,6 +10,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import (
     QObject,
+    QPointF,
     QRectF,
     QRunnable,
     Qt,
@@ -52,6 +53,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -81,6 +83,7 @@ from vesicle_analysis.corrections import (
     LabelOverlapError,
     MaskEdit,
     analysis_region_mask,
+    apply_split_group_decision,
     apply_shape,
     delete_pools,
     ellipse_mask,
@@ -109,7 +112,9 @@ from vesicle_analysis.segmentation import (
     SegmentationParameters,
     SegmentationResult,
     labels_to_rgba,
+    quality_review_to_rgba,
     segment_recording,
+    split_review_to_rgba,
 )
 from vesicle_analysis.trace_export import (
     AnalysisExportRequest,
@@ -145,6 +150,43 @@ def application_icon_path() -> Path | None:
 
 
 @dataclass(slots=True)
+class _PoolReviewSnapshot:
+    validity_by_pool: dict[int, bool]
+    merged_split_group_ids: set[int]
+    quality_review_pool_ids: set[int]
+    split_review_group_ids: set[int]
+
+    def copy(self) -> _PoolReviewSnapshot:
+        return _PoolReviewSnapshot(
+            validity_by_pool=dict(self.validity_by_pool),
+            merged_split_group_ids=set(self.merged_split_group_ids),
+            quality_review_pool_ids=set(self.quality_review_pool_ids),
+            split_review_group_ids=set(self.split_review_group_ids),
+        )
+
+
+@dataclass(slots=True)
+class _PoolEdit:
+    mask_edit: MaskEdit
+    review_before: _PoolReviewSnapshot
+    review_after: _PoolReviewSnapshot
+
+    @property
+    def description(self) -> str:
+        return self.mask_edit.description
+
+    def apply(
+        self,
+        labels: np.ndarray[Any, Any],
+        *,
+        undo: bool = False,
+    ) -> _PoolReviewSnapshot:
+        self.mask_edit.apply(labels, undo=undo)
+        source = self.review_before if undo else self.review_after
+        return source.copy()
+
+
+@dataclass(slots=True)
 class RecordingAnalysisState:
     motion_mode: str | None = None
     motion_result: MotionCorrectionResult | None = None
@@ -159,8 +201,13 @@ class RecordingAnalysisState:
     )
     segmentation_result: SegmentationResult | None = None
     corrected_labels: np.ndarray[Any, Any] | None = None
-    correction_undo: list[MaskEdit] = field(default_factory=list)
-    correction_redo: list[MaskEdit] = field(default_factory=list)
+    pool_validity: dict[int, bool] = field(default_factory=dict)
+    merged_split_group_ids: set[int] = field(default_factory=set)
+    quality_review_pool_ids: set[int] = field(default_factory=set)
+    split_review_group_ids: set[int] = field(default_factory=set)
+    review_state_initialized: bool = False
+    correction_undo: list[_PoolEdit] = field(default_factory=list)
+    correction_redo: list[_PoolEdit] = field(default_factory=list)
     selected_pool_ids: set[int] = field(default_factory=set)
     area_result: AreaAnalysisResult | None = None
     area_error: str | None = None
@@ -175,6 +222,50 @@ class RecordingAnalysisState:
     background_redo: list[_BackgroundEdit] = field(default_factory=list)
     trace_result: TraceExtractionResult | None = None
     excluded_pool_reasons: dict[int, str] = field(default_factory=dict)
+
+    def initialize_pool_review_state(self) -> None:
+        result = self.segmentation_result
+        if result is None:
+            self.clear_pool_review_state()
+            return
+        self.pool_validity = {
+            pool.pool_id: pool.accepted for pool in result.pools
+        }
+        self.merged_split_group_ids.clear()
+        self.quality_review_pool_ids = {pool.pool_id for pool in result.pools}
+        self.split_review_group_ids = {
+            group.group_id for group in result.split_groups
+        }
+        self.review_state_initialized = True
+
+    def ensure_pool_review_state(self) -> None:
+        if not self.review_state_initialized:
+            self.initialize_pool_review_state()
+
+    def clear_pool_review_state(self) -> None:
+        self.pool_validity.clear()
+        self.merged_split_group_ids.clear()
+        self.quality_review_pool_ids.clear()
+        self.split_review_group_ids.clear()
+        self.review_state_initialized = False
+
+    def pool_review_snapshot(self) -> _PoolReviewSnapshot:
+        self.ensure_pool_review_state()
+        return _PoolReviewSnapshot(
+            validity_by_pool=dict(self.pool_validity),
+            merged_split_group_ids=set(self.merged_split_group_ids),
+            quality_review_pool_ids=set(self.quality_review_pool_ids),
+            split_review_group_ids=set(self.split_review_group_ids),
+        )
+
+    def restore_pool_review_snapshot(
+        self, snapshot: _PoolReviewSnapshot
+    ) -> None:
+        self.pool_validity = dict(snapshot.validity_by_pool)
+        self.merged_split_group_ids = set(snapshot.merged_split_group_ids)
+        self.quality_review_pool_ids = set(snapshot.quality_review_pool_ids)
+        self.split_review_group_ids = set(snapshot.split_review_group_ids)
+        self.review_state_initialized = True
 
     @property
     def motion_ready(self) -> bool:
@@ -553,6 +644,10 @@ class ImageCanvas(QWidget):
         super().__init__(parent)
         self._frame: np.ndarray[Any, Any] | None = None
         self._levels: tuple[float, float] | None = None
+        self._pool_id_centroids: dict[int, tuple[float, float]] = {}
+        self._pool_id_labels: dict[int, pg.TextItem] = {}
+        self._pool_id_leaders: dict[int, pg.PlotCurveItem] = {}
+        self._pool_ids_visible = True
 
         self.graphics = pg.GraphicsLayoutWidget()
         self.view_box = DrawingViewBox()
@@ -563,9 +658,16 @@ class ImageCanvas(QWidget):
         self.background_item = pg.ImageItem()
         self.background_item.setZValue(14)
         self.view_box.addItem(self.background_item)
+        self.quality_review_item = pg.ImageItem()
+        self.quality_review_item.setZValue(16)
+        self.view_box.addItem(self.quality_review_item)
+        self.split_review_item = pg.ImageItem()
+        self.split_review_item.setZValue(17)
+        self.view_box.addItem(self.split_review_item)
         self.segmentation_item = pg.ImageItem()
         self.segmentation_item.setZValue(15)
         self.view_box.addItem(self.segmentation_item)
+        self.view_box.sigRangeChanged.connect(self._layout_pool_ids)
         self.histogram = pg.HistogramLUTItem(image=self.image_item)
         self.graphics.addItem(self.histogram, row=0, col=1)
 
@@ -604,6 +706,9 @@ class ImageCanvas(QWidget):
         self.image_item.clear()
         self.background_item.clear()
         self.segmentation_item.clear()
+        self.quality_review_item.clear()
+        self.split_review_item.clear()
+        self.clear_pool_ids()
         self.message.setText("Loading recording…")
         self.message.show()
 
@@ -641,6 +746,203 @@ class ImageCanvas(QWidget):
 
     def clear_segmentation(self) -> None:
         self.segmentation_item.clear()
+
+    def set_quality_review(
+        self,
+        candidate_labels: np.ndarray[Any, Any],
+        validity_by_pool: dict[int, bool],
+        quality_flags_by_pool: dict[int, tuple[str, ...]],
+        review_pool_ids: set[int],
+    ) -> None:
+        self.quality_review_item.setImage(
+            quality_review_to_rgba(
+                candidate_labels,
+                validity_by_pool,
+                quality_flags_by_pool,
+                review_pool_ids,
+            ),
+            autoLevels=False,
+        )
+
+    def set_split_review(
+        self,
+        candidate_labels: np.ndarray[Any, Any],
+        result: SegmentationResult,
+        merged_group_ids: set[int],
+        review_group_ids: set[int],
+    ) -> None:
+        self.split_review_item.setImage(
+            split_review_to_rgba(
+                candidate_labels,
+                result.split_groups,
+                merged_group_ids,
+                review_group_ids,
+            ),
+            autoLevels=False,
+        )
+
+    def clear_reviews(self) -> None:
+        self.quality_review_item.clear()
+        self.split_review_item.clear()
+
+    def set_pool_ids(self, labels: np.ndarray[Any, Any]) -> None:
+        self.clear_pool_ids()
+        for pool_id in (int(value) for value in np.unique(labels) if value > 0):
+            yy, xx = np.nonzero(labels == pool_id)
+            if not len(yy):
+                continue
+            centroid = (float(xx.mean()), float(yy.mean()))
+            label = pg.TextItem(
+                text=str(pool_id),
+                color=(255, 255, 255),
+                anchor=(0.5, 0.5),
+                fill=pg.mkBrush(0, 0, 0, 180),
+                border=pg.mkPen(255, 255, 255, 150),
+            )
+            label.setZValue(21)
+            leader = pg.PlotCurveItem(pen=pg.mkPen(255, 255, 255, 170, width=1))
+            leader.setZValue(20)
+            leader.hide()
+            self.view_box.addItem(leader)
+            self.view_box.addItem(label)
+            self._pool_id_centroids[pool_id] = centroid
+            self._pool_id_labels[pool_id] = label
+            self._pool_id_leaders[pool_id] = leader
+        self._layout_pool_ids()
+
+    def clear_pool_ids(self) -> None:
+        for item in self._pool_id_labels.values():
+            self.view_box.removeItem(item)
+        for item in self._pool_id_leaders.values():
+            self.view_box.removeItem(item)
+        self._pool_id_centroids.clear()
+        self._pool_id_labels.clear()
+        self._pool_id_leaders.clear()
+
+    def set_pool_ids_visible(self, visible: bool) -> None:
+        self._pool_ids_visible = visible
+        if not visible:
+            for item in self._pool_id_labels.values():
+                item.hide()
+            for item in self._pool_id_leaders.values():
+                item.hide()
+            return
+        self._layout_pool_ids()
+
+    @Slot()
+    def _layout_pool_ids(self, *_args: object) -> None:
+        if not self._pool_id_labels:
+            return
+        if not self._pool_ids_visible:
+            return
+
+        def rectangle(
+            center: QPointF, width: float, height: float
+        ) -> tuple[float, float, float, float]:
+            return (
+                center.x() - width / 2,
+                center.y() - height / 2,
+                center.x() + width / 2,
+                center.y() + height / 2,
+            )
+
+        def overlaps(
+            first: tuple[float, float, float, float],
+            second: tuple[float, float, float, float],
+        ) -> bool:
+            return not (
+                first[2] <= second[0]
+                or second[2] <= first[0]
+                or first[3] <= second[1]
+                or second[3] <= first[1]
+            )
+
+        desired: dict[int, QPointF] = {
+            pool_id: self.view_box.mapViewToScene(QPointF(*centroid))
+            for pool_id, centroid in self._pool_id_centroids.items()
+        }
+        sizes = {
+            pool_id: (max(18.0, 9.0 * len(str(pool_id)) + 8.0), 20.0)
+            for pool_id in desired
+        }
+        desired_rectangles = {
+            pool_id: rectangle(desired[pool_id], *sizes[pool_id]) for pool_id in desired
+        }
+        neighbors: dict[int, set[int]] = {pool_id: set() for pool_id in desired}
+        pool_ids = sorted(desired)
+        for index, first_id in enumerate(pool_ids):
+            for second_id in pool_ids[index + 1 :]:
+                if overlaps(
+                    desired_rectangles[first_id], desired_rectangles[second_id]
+                ):
+                    neighbors[first_id].add(second_id)
+                    neighbors[second_id].add(first_id)
+
+        clusters: list[list[int]] = []
+        unseen = set(pool_ids)
+        while unseen:
+            start = min(unseen)
+            stack = [start]
+            cluster: list[int] = []
+            unseen.remove(start)
+            while stack:
+                current = stack.pop()
+                cluster.append(current)
+                for neighbor in neighbors[current]:
+                    if neighbor in unseen:
+                        unseen.remove(neighbor)
+                        stack.append(neighbor)
+            clusters.append(sorted(cluster))
+
+        offsets = [(0.0, 0.0)]
+        directions = (
+            (1.0, 0.0),
+            (0.707, 0.707),
+            (0.0, 1.0),
+            (-0.707, 0.707),
+            (-1.0, 0.0),
+            (-0.707, -0.707),
+            (0.0, -1.0),
+            (0.707, -0.707),
+        )
+        for radius in (26.0, 52.0, 78.0):
+            offsets.extend((dx * radius, dy * radius) for dx, dy in directions)
+
+        occupied: list[tuple[float, float, float, float]] = []
+        for cluster in clusters:
+            if len(cluster) > 10:
+                for pool_id in cluster:
+                    self._pool_id_labels[pool_id].hide()
+                    self._pool_id_leaders[pool_id].hide()
+                continue
+            for pool_id in cluster:
+                label = self._pool_id_labels[pool_id]
+                leader = self._pool_id_leaders[pool_id]
+                selected_offset = offsets[-1]
+                selected_rect = desired_rectangles[pool_id]
+                for offset in offsets:
+                    candidate_center = desired[pool_id] + QPointF(*offset)
+                    candidate_rect = rectangle(candidate_center, *sizes[pool_id])
+                    if not any(
+                        overlaps(candidate_rect, existing) for existing in occupied
+                    ):
+                        selected_offset = offset
+                        selected_rect = candidate_rect
+                        break
+                occupied.append(selected_rect)
+                scene_position = desired[pool_id] + QPointF(*selected_offset)
+                view_position = self.view_box.mapSceneToView(scene_position)
+                label.setPos(view_position)
+                label.show()
+                if selected_offset == (0.0, 0.0):
+                    leader.hide()
+                else:
+                    centroid = self._pool_id_centroids[pool_id]
+                    leader.setData(
+                        [centroid[0], view_position.x()],
+                        [centroid[1], view_position.y()],
+                    )
+                    leader.show()
 
     def set_backgrounds(
         self, labels: np.ndarray[Any, Any], selected_ids: tuple[int, ...] = ()
@@ -1983,6 +2285,7 @@ class MainWindow(QMainWindow):
         self._updating_region = False
         self._background_move_roi: pg.RectROI | None = None
         self._background_move_origin: tuple[int, int] | None = None
+        self._overlay_visibility_before_review: tuple[bool, bool, bool] | None = None
 
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._advance_playback)
@@ -2050,12 +2353,51 @@ class MainWindow(QMainWindow):
         analysis_menu.addAction(self.delete_region_action)
         analysis_menu.addAction(self.clear_regions_action)
 
-        toolbar = self.addToolBar("Files")
-        toolbar.setMovable(False)
-        toolbar.addAction(self.open_file_action)
-        toolbar.addAction(self.open_folder_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.draw_region_action)
+        self.main_toolbar = self.addToolBar("Files and overlays")
+        self.main_toolbar.setMovable(False)
+        self.main_toolbar.addAction(self.open_file_action)
+        self.main_toolbar.addAction(self.open_folder_action)
+        self.main_toolbar.addSeparator()
+        self.main_toolbar.addAction(self.draw_region_action)
+        self.main_toolbar.addSeparator()
+
+        self.top_show_segmentation_checkbox = QCheckBox(
+            "Show accepted segmentation results"
+        )
+        self.top_show_segmentation_checkbox.setChecked(True)
+        self.top_show_segmentation_checkbox.setEnabled(False)
+        self.top_show_segmentation_checkbox.toggled.connect(
+            self._segmentation_visibility_changed
+        )
+        self.main_toolbar.addWidget(self.top_show_segmentation_checkbox)
+
+        self.top_show_pool_ids_checkbox = QCheckBox("Show pool IDs")
+        self.top_show_pool_ids_checkbox.setChecked(True)
+        self.top_show_pool_ids_checkbox.setEnabled(False)
+        self.top_show_pool_ids_checkbox.toggled.connect(
+            self._pool_ids_visibility_changed
+        )
+        self.main_toolbar.addWidget(self.top_show_pool_ids_checkbox)
+
+        self.top_show_quality_review_checkbox = QCheckBox(
+            "Show valid/invalid review"
+        )
+        self.top_show_quality_review_checkbox.setChecked(False)
+        self.top_show_quality_review_checkbox.setEnabled(False)
+        self.top_show_quality_review_checkbox.toggled.connect(
+            self._quality_review_visibility_changed
+        )
+        self.main_toolbar.addWidget(self.top_show_quality_review_checkbox)
+
+        self.top_show_split_review_checkbox = QCheckBox(
+            "Show automatic split review"
+        )
+        self.top_show_split_review_checkbox.setChecked(False)
+        self.top_show_split_review_checkbox.setEnabled(False)
+        self.top_show_split_review_checkbox.toggled.connect(
+            self._split_review_visibility_changed
+        )
+        self.main_toolbar.addWidget(self.top_show_split_review_checkbox)
 
     def _build_ui(self) -> None:
         self.recording_list = QListWidget()
@@ -2158,7 +2500,8 @@ class MainWindow(QMainWindow):
         self.calculate_motion_button.clicked.connect(self._start_current_motion)
         self.calculate_all_motion_button = QPushButton("Calculate all")
         self.calculate_all_motion_button.setToolTip(
-            "Apply the current correction mode to every loaded recording and calculate sequentially"
+            "Apply the current correction mode to every loaded recording and "
+            "calculate sequentially"
         )
         self.calculate_all_motion_button.clicked.connect(self._start_all_motion)
         motion_calculation_buttons.addWidget(self.calculate_motion_button)
@@ -2250,7 +2593,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(separator)
         layout.addWidget(QLabel("Automatic pool segmentation"))
 
-        segmentation_form = QFormLayout()
+        segmentation_tabs = QTabWidget()
+        basic_segmentation_page = QWidget()
+        segmentation_form = QFormLayout(basic_segmentation_page)
         segmentation_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.segmentation_threshold_spin = QDoubleSpinBox()
         self.segmentation_threshold_spin.setRange(1.5, 8.0)
@@ -2267,6 +2612,39 @@ class MainWindow(QMainWindow):
             "Detection threshold:", self.segmentation_threshold_spin
         )
 
+        segmentation_tabs.addTab(basic_segmentation_page, "Basic")
+
+        advanced_segmentation_page = QWidget()
+        advanced_layout = QVBoxLayout(advanced_segmentation_page)
+        advanced_layout.setContentsMargins(4, 4, 4, 4)
+        advanced_form = QFormLayout()
+        advanced_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        self.segmentation_prominence_spin = QDoubleSpinBox()
+        self.segmentation_prominence_spin.setRange(0.0, 10.0)
+        self.segmentation_prominence_spin.setDecimals(2)
+        self.segmentation_prominence_spin.setSingleStep(0.25)
+        self.segmentation_prominence_spin.setValue(1.0)
+        self.segmentation_prominence_spin.setSuffix(" sigma")
+        self.segmentation_prominence_spin.setToolTip(
+            "Minimum height of a local maximum above its surrounding saddle"
+        )
+        self.segmentation_prominence_spin.valueChanged.connect(
+            self._segmentation_parameters_changed
+        )
+        advanced_form.addRow("Peak prominence:", self.segmentation_prominence_spin)
+
+        self.segmentation_baseline_combo = QComboBox()
+        self.segmentation_baseline_combo.addItem("Robust median / MAD", "robust")
+        self.segmentation_baseline_combo.addItem(
+            "Mean / standard deviation", "mean_std"
+        )
+        self.segmentation_baseline_combo.addItem("Manual thresholds only", "manual")
+        self.segmentation_baseline_combo.currentIndexChanged.connect(
+            self._segmentation_parameters_changed
+        )
+        advanced_form.addRow("Population baseline:", self.segmentation_baseline_combo)
+
         self.segmentation_min_area_spin = QSpinBox()
         self.segmentation_min_area_spin.setRange(1, 1000)
         self.segmentation_min_area_spin.setValue(8)
@@ -2274,7 +2652,7 @@ class MainWindow(QMainWindow):
         self.segmentation_min_area_spin.valueChanged.connect(
             self._segmentation_parameters_changed
         )
-        segmentation_form.addRow("Minimum area:", self.segmentation_min_area_spin)
+        advanced_form.addRow("Absolute minimum area:", self.segmentation_min_area_spin)
 
         self.segmentation_max_area_spin = QSpinBox()
         self.segmentation_max_area_spin.setRange(1, 10000)
@@ -2283,30 +2661,154 @@ class MainWindow(QMainWindow):
         self.segmentation_max_area_spin.valueChanged.connect(
             self._segmentation_parameters_changed
         )
-        segmentation_form.addRow("Maximum area:", self.segmentation_max_area_spin)
+        advanced_form.addRow("Absolute maximum area:", self.segmentation_max_area_spin)
 
-        self.segmentation_distance_spin = QSpinBox()
-        self.segmentation_distance_spin.setRange(1, 30)
-        self.segmentation_distance_spin.setValue(4)
-        self.segmentation_distance_spin.setSuffix(" px")
-        self.segmentation_distance_spin.valueChanged.connect(
-            self._segmentation_parameters_changed
+        self.segmentation_filter_checks: dict[str, QCheckBox] = {}
+        self.segmentation_multiplier_spins: dict[str, QDoubleSpinBox] = {}
+        for metric, title in (
+            ("area", "Area outliers"),
+            ("circularity", "Low circularity"),
+            ("solidity", "Low solidity"),
+            ("local_contrast", "Low local contrast"),
+            ("intensity_variation", "High intensity variation"),
+        ):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            enabled = QCheckBox("Enable")
+            enabled.setChecked(True)
+            multiplier = QDoubleSpinBox()
+            multiplier.setRange(0.5, 10.0)
+            multiplier.setDecimals(1)
+            multiplier.setSingleStep(0.5)
+            multiplier.setValue(3.0)
+            multiplier.setPrefix("± " if metric == "area" else "")
+            multiplier.setSuffix(" × spread")
+            enabled.toggled.connect(self._segmentation_parameters_changed)
+            multiplier.valueChanged.connect(self._segmentation_parameters_changed)
+            row_layout.addWidget(enabled)
+            row_layout.addWidget(multiplier, 1)
+            self.segmentation_filter_checks[metric] = enabled
+            self.segmentation_multiplier_spins[metric] = multiplier
+            advanced_form.addRow(f"{title}:", row_widget)
+
+        def optional_threshold(
+            maximum: float, decimals: int, step: float
+        ) -> QDoubleSpinBox:
+            control = QDoubleSpinBox()
+            control.setRange(0.0, maximum)
+            control.setDecimals(decimals)
+            control.setSingleStep(step)
+            control.setSpecialValueText("Off")
+            control.setValue(0.0)
+            control.valueChanged.connect(self._segmentation_parameters_changed)
+            return control
+
+        self.segmentation_min_circularity_spin = optional_threshold(1.0, 2, 0.05)
+        advanced_form.addRow(
+            "Absolute circularity minimum:", self.segmentation_min_circularity_spin
         )
-        segmentation_form.addRow("Seed separation:", self.segmentation_distance_spin)
-        layout.addLayout(segmentation_form)
+        self.segmentation_min_solidity_spin = optional_threshold(1.0, 2, 0.05)
+        advanced_form.addRow(
+            "Absolute solidity minimum:", self.segmentation_min_solidity_spin
+        )
+        self.segmentation_min_contrast_spin = optional_threshold(100.0, 1, 0.5)
+        advanced_form.addRow(
+            "Absolute contrast minimum:", self.segmentation_min_contrast_spin
+        )
+        self.segmentation_max_variation_spin = optional_threshold(10.0, 2, 0.1)
+        advanced_form.addRow(
+            "Absolute variation maximum:", self.segmentation_max_variation_spin
+        )
+        advanced_layout.addLayout(advanced_form)
+        self.reset_segmentation_filters_button = QPushButton("Reset filtering defaults")
+        self.reset_segmentation_filters_button.clicked.connect(
+            self._reset_segmentation_filter_defaults
+        )
+        advanced_layout.addWidget(self.reset_segmentation_filters_button)
+        segmentation_tabs.addTab(advanced_segmentation_page, "Advanced filtering")
+        layout.addWidget(segmentation_tabs)
 
         self.run_segmentation_button = QPushButton("Run automatic segmentation")
         self.run_segmentation_button.setEnabled(False)
         self.run_segmentation_button.clicked.connect(self._start_segmentation)
         layout.addWidget(self.run_segmentation_button)
 
-        self.show_segmentation_checkbox = QCheckBox("Show segmentation overlay")
+        self.show_segmentation_checkbox = QCheckBox(
+            "Show accepted segmentation results"
+        )
         self.show_segmentation_checkbox.setChecked(True)
         self.show_segmentation_checkbox.setEnabled(False)
         self.show_segmentation_checkbox.toggled.connect(
             self._segmentation_visibility_changed
         )
         layout.addWidget(self.show_segmentation_checkbox)
+
+        self.show_pool_ids_checkbox = QCheckBox("Show pool IDs")
+        self.show_pool_ids_checkbox.setChecked(True)
+        self.show_pool_ids_checkbox.setEnabled(False)
+        self.show_pool_ids_checkbox.toggled.connect(self._pool_ids_visibility_changed)
+        layout.addWidget(self.show_pool_ids_checkbox)
+
+        self.show_quality_review_checkbox = QCheckBox("Show valid/invalid review")
+        self.show_quality_review_checkbox.setChecked(False)
+        self.show_quality_review_checkbox.setEnabled(False)
+        self.show_quality_review_checkbox.toggled.connect(
+            self._quality_review_visibility_changed
+        )
+        layout.addWidget(self.show_quality_review_checkbox)
+
+        self.review_quality_button = QPushButton("Review valid/invalid results")
+        self.review_quality_button.setCheckable(True)
+        self.review_quality_button.setEnabled(False)
+        self.review_quality_button.setToolTip(
+            "While active, click any automatic candidate to toggle its validity"
+        )
+        self.review_quality_button.toggled.connect(self._quality_review_toggled)
+        layout.addWidget(self.review_quality_button)
+
+        self.quality_review_list = QListWidget()
+        self.quality_review_list.setMinimumHeight(70)
+        self.quality_review_list.setMaximumHeight(120)
+        self.quality_review_list.itemClicked.connect(
+            self._quality_review_list_clicked
+        )
+        layout.addWidget(self.quality_review_list)
+        quality_legend = QLabel(
+            "Validity: green = valid; red = invalid; orange = shape/intensity; "
+            "blue = area. White edges indicate multiple filtering reasons."
+        )
+        quality_legend.setWordWrap(True)
+        layout.addWidget(quality_legend)
+
+        self.show_split_review_checkbox = QCheckBox("Show automatic split review")
+        self.show_split_review_checkbox.setChecked(False)
+        self.show_split_review_checkbox.setEnabled(False)
+        self.show_split_review_checkbox.toggled.connect(
+            self._split_review_visibility_changed
+        )
+        layout.addWidget(self.show_split_review_checkbox)
+
+        self.review_split_button = QPushButton("Review automatic splits")
+        self.review_split_button.setCheckable(True)
+        self.review_split_button.setEnabled(False)
+        self.review_split_button.setToolTip(
+            "While active, click a proposed split to toggle the group between split and merged"
+        )
+        self.review_split_button.toggled.connect(self._split_review_toggled)
+        layout.addWidget(self.review_split_button)
+
+        self.split_review_list = QListWidget()
+        self.split_review_list.setMinimumHeight(60)
+        self.split_review_list.setMaximumHeight(110)
+        self.split_review_list.itemClicked.connect(self._split_review_list_clicked)
+        layout.addWidget(self.split_review_list)
+        split_legend = QLabel(
+            "Splits: magenta = currently split; cyan = currently merged; white "
+            "edges show the original proposed pieces."
+        )
+        split_legend.setWordWrap(True)
+        layout.addWidget(split_legend)
 
         self.segmentation_summary_label = QLabel(
             "Calculate a recording peak before segmentation."
@@ -3209,6 +3711,7 @@ class MainWindow(QMainWindow):
         state.manual_peak_index = None
         state.segmentation_result = None
         state.corrected_labels = None
+        state.clear_pool_review_state()
         state.correction_undo.clear()
         state.correction_redo.clear()
         state.selected_pool_ids.clear()
@@ -3706,6 +4209,7 @@ class MainWindow(QMainWindow):
             state.manual_peak_index = None
             state.segmentation_result = None
             state.corrected_labels = None
+            state.clear_pool_review_state()
             state.correction_undo.clear()
             state.correction_redo.clear()
             state.selected_pool_ids.clear()
@@ -3907,13 +4411,60 @@ class MainWindow(QMainWindow):
         parameters = state.segmentation_parameters
         controls = (
             (self.segmentation_threshold_spin, parameters.seed_threshold_sigma),
+            (
+                self.segmentation_prominence_spin,
+                parameters.minimum_peak_prominence_sigma,
+            ),
             (self.segmentation_min_area_spin, parameters.minimum_area_px),
             (self.segmentation_max_area_spin, parameters.maximum_area_px),
-            (self.segmentation_distance_spin, parameters.minimum_seed_distance),
+            (
+                self.segmentation_min_circularity_spin,
+                parameters.minimum_circularity or 0.0,
+            ),
+            (
+                self.segmentation_min_solidity_spin,
+                parameters.minimum_solidity or 0.0,
+            ),
+            (
+                self.segmentation_min_contrast_spin,
+                parameters.minimum_local_contrast or 0.0,
+            ),
+            (
+                self.segmentation_max_variation_spin,
+                parameters.maximum_intensity_variation or 0.0,
+            ),
         )
         for control, value in controls:
             control.blockSignals(True)
             control.setValue(value)
+            control.blockSignals(False)
+        baseline_index = self.segmentation_baseline_combo.findData(
+            parameters.baseline_mode
+        )
+        self.segmentation_baseline_combo.blockSignals(True)
+        self.segmentation_baseline_combo.setCurrentIndex(max(0, baseline_index))
+        self.segmentation_baseline_combo.blockSignals(False)
+        enabled_values = {
+            "area": parameters.filter_area,
+            "circularity": parameters.filter_circularity,
+            "solidity": parameters.filter_solidity,
+            "local_contrast": parameters.filter_local_contrast,
+            "intensity_variation": parameters.filter_intensity_variation,
+        }
+        multiplier_values = {
+            "area": parameters.area_outlier_multiplier,
+            "circularity": parameters.circularity_outlier_multiplier,
+            "solidity": parameters.solidity_outlier_multiplier,
+            "local_contrast": parameters.local_contrast_outlier_multiplier,
+            "intensity_variation": parameters.intensity_variation_outlier_multiplier,
+        }
+        for metric, control in self.segmentation_filter_checks.items():
+            control.blockSignals(True)
+            control.setChecked(enabled_values[metric])
+            control.blockSignals(False)
+        for metric, control in self.segmentation_multiplier_spins.items():
+            control.blockSignals(True)
+            control.setValue(multiplier_values[metric])
             control.blockSignals(False)
         self._show_segmentation_state()
 
@@ -3984,10 +4535,49 @@ class MainWindow(QMainWindow):
             self.segmentation_max_area_spin.blockSignals(False)
         state.segmentation_parameters = SegmentationParameters(
             seed_threshold_sigma=self.segmentation_threshold_spin.value(),
-            minimum_seed_distance=self.segmentation_distance_spin.value(),
+            minimum_peak_prominence_sigma=self.segmentation_prominence_spin.value(),
             minimum_area_px=minimum_area,
             maximum_area_px=self.segmentation_max_area_spin.value(),
+            baseline_mode=str(self.segmentation_baseline_combo.currentData()),
+            filter_area=self.segmentation_filter_checks["area"].isChecked(),
+            filter_circularity=self.segmentation_filter_checks[
+                "circularity"
+            ].isChecked(),
+            filter_solidity=self.segmentation_filter_checks["solidity"].isChecked(),
+            filter_local_contrast=self.segmentation_filter_checks[
+                "local_contrast"
+            ].isChecked(),
+            filter_intensity_variation=self.segmentation_filter_checks[
+                "intensity_variation"
+            ].isChecked(),
+            area_outlier_multiplier=self.segmentation_multiplier_spins["area"].value(),
+            circularity_outlier_multiplier=self.segmentation_multiplier_spins[
+                "circularity"
+            ].value(),
+            solidity_outlier_multiplier=self.segmentation_multiplier_spins[
+                "solidity"
+            ].value(),
+            local_contrast_outlier_multiplier=self.segmentation_multiplier_spins[
+                "local_contrast"
+            ].value(),
+            intensity_variation_outlier_multiplier=self.segmentation_multiplier_spins[
+                "intensity_variation"
+            ].value(),
+            minimum_circularity=self.segmentation_min_circularity_spin.value() or None,
+            minimum_solidity=self.segmentation_min_solidity_spin.value() or None,
+            minimum_local_contrast=self.segmentation_min_contrast_spin.value() or None,
+            maximum_intensity_variation=self.segmentation_max_variation_spin.value()
+            or None,
         )
+        self._invalidate_segmentation()
+
+    @Slot()
+    def _reset_segmentation_filter_defaults(self) -> None:
+        state = self.current_analysis_state
+        if state is None:
+            return
+        state.segmentation_parameters = SegmentationParameters()
+        self._restore_segmentation_state()
         self._invalidate_segmentation()
 
     def _invalidate_segmentation(self) -> None:
@@ -3998,6 +4588,7 @@ class MainWindow(QMainWindow):
         if state is not None:
             state.segmentation_result = None
             state.corrected_labels = None
+            state.clear_pool_review_state()
             state.correction_undo.clear()
             state.correction_redo.clear()
             state.selected_pool_ids.clear()
@@ -4013,6 +4604,8 @@ class MainWindow(QMainWindow):
             state.excluded_pool_reasons.clear()
         if hasattr(self, "canvas"):
             self.canvas.clear_segmentation()
+            self.canvas.clear_reviews()
+            self.canvas.clear_pool_ids()
             self.canvas.clear_backgrounds()
         if hasattr(self, "segmentation_summary_label"):
             self._show_segmentation_state()
@@ -4066,6 +4659,7 @@ class MainWindow(QMainWindow):
             return
         state.segmentation_result = result
         state.corrected_labels = result.labels.copy()
+        state.initialize_pool_review_state()
         state.correction_undo.clear()
         state.correction_redo.clear()
         state.selected_pool_ids.clear()
@@ -4084,7 +4678,8 @@ class MainWindow(QMainWindow):
         self._show_area_state()
         self._go_to_effective_peak()
         self.statusBar().showMessage(
-            f"Automatic segmentation found {len(result.pools)} pool(s)"
+            f"Automatic segmentation accepted {len(result.accepted_pool_ids)} of "
+            f"{len(result.pools)} candidate pool(s)"
         )
 
     @Slot(int, str)
@@ -4107,8 +4702,26 @@ class MainWindow(QMainWindow):
         self.run_segmentation_button.setEnabled(can_segment)
         if state is None or state.segmentation_result is None:
             self.run_segmentation_button.setText("Run automatic segmentation")
-            self.show_segmentation_checkbox.setEnabled(False)
+            for control in (
+                self.show_segmentation_checkbox,
+                self.show_pool_ids_checkbox,
+                self.show_quality_review_checkbox,
+                self.show_split_review_checkbox,
+                self.top_show_segmentation_checkbox,
+                self.top_show_pool_ids_checkbox,
+                self.top_show_quality_review_checkbox,
+                self.top_show_split_review_checkbox,
+                self.review_quality_button,
+                self.review_split_button,
+            ):
+                control.setEnabled(False)
+            self.review_quality_button.setChecked(False)
+            self.review_split_button.setChecked(False)
             self.canvas.clear_segmentation()
+            self.canvas.clear_reviews()
+            self.canvas.clear_pool_ids()
+            self.quality_review_list.clear()
+            self.split_review_list.clear()
             self.segmentation_summary_label.setText(
                 "Calculate a recording peak before segmentation."
                 if not can_segment
@@ -4119,11 +4732,36 @@ class MainWindow(QMainWindow):
             return
 
         result = state.segmentation_result
+        state.ensure_pool_review_state()
         labels = self._current_labels()
         if labels is None:
             return
         self.run_segmentation_button.setText("Rerun automatic segmentation")
-        self.show_segmentation_checkbox.setEnabled(True)
+        for control in (
+            self.show_segmentation_checkbox,
+            self.show_pool_ids_checkbox,
+            self.top_show_segmentation_checkbox,
+            self.top_show_pool_ids_checkbox,
+        ):
+            control.setEnabled(True)
+        has_quality_review = bool(state.quality_review_pool_ids)
+        for control in (
+            self.show_quality_review_checkbox,
+            self.top_show_quality_review_checkbox,
+            self.review_quality_button,
+        ):
+            control.setEnabled(has_quality_review)
+        if not has_quality_review:
+            self.review_quality_button.setChecked(False)
+        has_split_review = bool(state.split_review_group_ids)
+        for control in (
+            self.show_split_review_checkbox,
+            self.top_show_split_review_checkbox,
+            self.review_split_button,
+        ):
+            control.setEnabled(has_split_review)
+        if not has_split_review:
+            self.review_split_button.setChecked(False)
         self.canvas.set_segmentation(
             labels,
             tuple(sorted(state.selected_pool_ids)),
@@ -4132,21 +4770,233 @@ class MainWindow(QMainWindow):
         self.canvas.segmentation_item.setVisible(
             self.show_segmentation_checkbox.isChecked()
         )
+        self._refresh_review_overlays()
+        self._refresh_review_lists()
+        self._refresh_pool_id_overlay()
         current_count = len(np.unique(labels)) - 1
+        rejected_count = sum(
+            1
+            for pool_id in state.quality_review_pool_ids
+            if not state.pool_validity.get(pool_id, False)
+        )
         self.segmentation_summary_label.setText(
-            f"Found {len(result.pools)} automatic pool(s); {current_count} currently "
-            f"accepted on frame "
+            f"Found {len(result.pools)} candidate pool(s); {current_count} currently "
+            f"accepted and {rejected_count} currently invalid on frame "
             f"{result.peak_frame_index + 1}.\n"
             f"Threshold: {result.parameters.seed_threshold_sigma:g} sigma; "
-            f"area: {result.parameters.minimum_area_px}-"
-            f"{result.parameters.maximum_area_px} px²."
+            f"prominence: {result.parameters.minimum_peak_prominence_sigma:g} sigma; "
+            f"baseline: {result.parameters.baseline_mode}."
         )
         self._show_correction_state()
         self._show_background_state()
 
     @Slot(bool)
     def _segmentation_visibility_changed(self, visible: bool) -> None:
+        self._synchronize_overlay_checkboxes(
+            visible,
+            "show_segmentation_checkbox",
+            "top_show_segmentation_checkbox",
+        )
         self.canvas.segmentation_item.setVisible(visible)
+
+    @Slot(bool)
+    def _pool_ids_visibility_changed(self, visible: bool) -> None:
+        self._synchronize_overlay_checkboxes(
+            visible,
+            "show_pool_ids_checkbox",
+            "top_show_pool_ids_checkbox",
+        )
+        self._refresh_pool_id_overlay()
+
+    @Slot(bool)
+    def _quality_review_visibility_changed(self, visible: bool) -> None:
+        self._synchronize_overlay_checkboxes(
+            visible,
+            "show_quality_review_checkbox",
+            "top_show_quality_review_checkbox",
+        )
+        self.canvas.quality_review_item.setVisible(visible)
+        self._refresh_pool_id_overlay()
+
+    @Slot(bool)
+    def _split_review_visibility_changed(self, visible: bool) -> None:
+        self._synchronize_overlay_checkboxes(
+            visible,
+            "show_split_review_checkbox",
+            "top_show_split_review_checkbox",
+        )
+        self.canvas.split_review_item.setVisible(visible)
+        self._refresh_pool_id_overlay()
+
+    def _synchronize_overlay_checkboxes(
+        self, visible: bool, *attribute_names: str
+    ) -> None:
+        for attribute_name in attribute_names:
+            control = getattr(self, attribute_name, None)
+            if control is None or control.isChecked() == visible:
+                continue
+            control.blockSignals(True)
+            control.setChecked(visible)
+            control.blockSignals(False)
+
+    def _refresh_pool_id_overlay(self) -> None:
+        state = self.current_analysis_state
+        labels = self._current_labels()
+        if state is None or labels is None:
+            self.canvas.clear_pool_ids()
+            return
+        display_labels = np.asarray(labels, dtype=np.int32).copy()
+        result = state.segmentation_result
+        if result is None:
+            self.canvas.clear_pool_ids()
+            return
+        review_pool_ids: set[int] = set()
+        if self.show_quality_review_checkbox.isChecked():
+            review_pool_ids.update(state.quality_review_pool_ids)
+        if self.show_split_review_checkbox.isChecked():
+            for group in result.split_groups:
+                if group.group_id in state.split_review_group_ids:
+                    review_pool_ids.update(group.pool_ids)
+        if review_pool_ids:
+            candidates = result.candidate_labels
+            review_mask = np.isin(candidates, tuple(review_pool_ids))
+            display_labels[review_mask] = candidates[review_mask]
+        self.canvas.set_pool_ids(display_labels)
+        self.canvas.set_pool_ids_visible(self.show_pool_ids_checkbox.isChecked())
+
+    def _refresh_review_overlays(self) -> None:
+        state = self.current_analysis_state
+        if state is None or state.segmentation_result is None:
+            self.canvas.clear_reviews()
+            return
+        result = state.segmentation_result
+        state.ensure_pool_review_state()
+        self.canvas.set_quality_review(
+            result.candidate_labels,
+            state.pool_validity,
+            result.quality_flags_by_pool,
+            state.quality_review_pool_ids,
+        )
+        self.canvas.set_split_review(
+            result.candidate_labels,
+            result,
+            state.merged_split_group_ids,
+            state.split_review_group_ids,
+        )
+        self.canvas.quality_review_item.setVisible(
+            self.show_quality_review_checkbox.isChecked()
+        )
+        self.canvas.split_review_item.setVisible(
+            self.show_split_review_checkbox.isChecked()
+        )
+
+    def _refresh_review_lists(self) -> None:
+        state = self.current_analysis_state
+        self.quality_review_list.clear()
+        self.split_review_list.clear()
+        if state is None or state.segmentation_result is None:
+            return
+        result = state.segmentation_result
+        quality_flags = result.quality_flags_by_pool
+        for pool_id in sorted(state.quality_review_pool_ids):
+            valid = state.pool_validity.get(pool_id, False)
+            flags = quality_flags.get(pool_id, ())
+            detail = "valid" if valid else "invalid"
+            if flags:
+                detail += f" ({', '.join(flags)})"
+            item = QListWidgetItem(f"Pool {pool_id} — {detail}")
+            item.setData(Qt.ItemDataRole.UserRole, pool_id)
+            item.setToolTip(
+                "; ".join(flags) if flags else "No automatic quality warning"
+            )
+            self.quality_review_list.addItem(item)
+        for group in result.split_groups:
+            if group.group_id not in state.split_review_group_ids:
+                continue
+            status = (
+                "merged"
+                if group.group_id in state.merged_split_group_ids
+                else "split"
+            )
+            member_text = ", ".join(str(value) for value in group.pool_ids)
+            item = QListWidgetItem(
+                f"Group {group.group_id} — {status}; pools {member_text}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, group.group_id)
+            item.setToolTip(
+                f"Parent pool {group.parent_pool_id}; click to toggle split/merged"
+            )
+            self.split_review_list.addItem(item)
+
+    def _set_review_mode(self, mode: str, reviewing: bool) -> None:
+        quality_mode = mode == "quality"
+        other_button = (
+            self.review_split_button if quality_mode else self.review_quality_button
+        )
+        overlay_checkbox = (
+            self.show_quality_review_checkbox
+            if quality_mode
+            else self.show_split_review_checkbox
+        )
+        inactive_overlay_checkbox = (
+            self.show_split_review_checkbox
+            if quality_mode
+            else self.show_quality_review_checkbox
+        )
+        if reviewing:
+            if other_button.isChecked():
+                other_button.blockSignals(True)
+                other_button.setChecked(False)
+                other_button.blockSignals(False)
+            if self._overlay_visibility_before_review is None:
+                self._overlay_visibility_before_review = (
+                    self.show_segmentation_checkbox.isChecked(),
+                    self.show_quality_review_checkbox.isChecked(),
+                    self.show_split_review_checkbox.isChecked(),
+                )
+            previous = self._overlay_visibility_before_review
+            self.show_segmentation_checkbox.setChecked(False)
+            inactive_overlay_checkbox.setChecked(
+                previous[2] if quality_mode else previous[1]
+            )
+            overlay_checkbox.setChecked(True)
+            message = (
+                "Validity review active: click any candidate to toggle valid/invalid"
+                if quality_mode
+                else "Split review active: click any proposed group to toggle split/merged"
+            )
+            self.statusBar().showMessage(message)
+            return
+        if (
+            not other_button.isChecked()
+            and self._overlay_visibility_before_review is not None
+        ):
+            previous = self._overlay_visibility_before_review
+            self._overlay_visibility_before_review = None
+            self.show_segmentation_checkbox.setChecked(previous[0])
+            self.show_quality_review_checkbox.setChecked(previous[1])
+            self.show_split_review_checkbox.setChecked(previous[2])
+        self.statusBar().showMessage("Review finished")
+
+    @Slot(bool)
+    def _quality_review_toggled(self, reviewing: bool) -> None:
+        self._set_review_mode("quality", reviewing)
+
+    @Slot(bool)
+    def _split_review_toggled(self, reviewing: bool) -> None:
+        self._set_review_mode("split", reviewing)
+
+    @Slot(QListWidgetItem)
+    def _quality_review_list_clicked(self, item: QListWidgetItem) -> None:
+        if not self.review_quality_button.isChecked():
+            self.review_quality_button.setChecked(True)
+        self._toggle_pool_validity(int(item.data(Qt.ItemDataRole.UserRole)))
+
+    @Slot(QListWidgetItem)
+    def _split_review_list_clicked(self, item: QListWidgetItem) -> None:
+        if not self.review_split_button.isChecked():
+            self.review_split_button.setChecked(True)
+        self._toggle_split_group(int(item.data(Qt.ItemDataRole.UserRole)))
 
     def _current_labels(self) -> np.ndarray[Any, Any] | None:
         state = self.current_analysis_state
@@ -4261,6 +5111,23 @@ class MainWindow(QMainWindow):
         self.canvas.segmentation_item.setVisible(
             self.show_segmentation_checkbox.isChecked()
         )
+        if state.segmentation_result is not None:
+            state.ensure_pool_review_state()
+            self._refresh_review_overlays()
+        has_quality_review = bool(state.quality_review_pool_ids)
+        self.show_quality_review_checkbox.setEnabled(has_quality_review)
+        self.top_show_quality_review_checkbox.setEnabled(has_quality_review)
+        self.review_quality_button.setEnabled(has_quality_review)
+        if not has_quality_review:
+            self.review_quality_button.setChecked(False)
+        has_split_review = bool(state.split_review_group_ids)
+        self.show_split_review_checkbox.setEnabled(has_split_review)
+        self.top_show_split_review_checkbox.setEnabled(has_split_review)
+        self.review_split_button.setEnabled(has_split_review)
+        if not has_split_review:
+            self.review_split_button.setChecked(False)
+        self._refresh_review_lists()
+        self._refresh_pool_id_overlay()
 
     @Slot()
     def _pool_selection_changed(self) -> None:
@@ -4282,6 +5149,41 @@ class MainWindow(QMainWindow):
         x, y, toggle = payload
         column, row = int(np.floor(float(x))), int(np.floor(float(y)))
         if not (0 <= row < labels.shape[0] and 0 <= column < labels.shape[1]):
+            return
+
+        if (
+            self.review_quality_button.isChecked()
+            and state.segmentation_result is not None
+        ):
+            pool_id = int(state.segmentation_result.candidate_labels[row, column])
+            if pool_id in state.quality_review_pool_ids:
+                self._toggle_pool_validity(pool_id)
+            else:
+                self.statusBar().showMessage(
+                    "The clicked location is not an active validity candidate"
+                )
+            return
+
+        if (
+            self.review_split_button.isChecked()
+            and state.segmentation_result is not None
+        ):
+            pool_id = int(state.segmentation_result.candidate_labels[row, column])
+            group = next(
+                (
+                    item
+                    for item in state.segmentation_result.split_groups
+                    if pool_id in item.pool_ids
+                    and item.group_id in state.split_review_group_ids
+                ),
+                None,
+            )
+            if group is not None:
+                self._toggle_split_group(group.group_id)
+            else:
+                self.statusBar().showMessage(
+                    "The clicked location is not an active automatic split"
+                )
             return
 
         background_labels = self._current_background_labels()
@@ -4312,6 +5214,143 @@ class MainWindow(QMainWindow):
         state.selected_background_id = None
         self._show_correction_state()
         self._refresh_background_selection_ui()
+
+    def _toggle_pool_validity(self, pool_id: int) -> None:
+        state = self.current_analysis_state
+        labels = self._current_labels()
+        if (
+            state is None
+            or labels is None
+            or state.segmentation_result is None
+            or pool_id not in state.quality_review_pool_ids
+        ):
+            return
+        result = state.segmentation_result
+        review_after = state.pool_review_snapshot()
+        review_after.validity_by_pool[pool_id] = not review_after.validity_by_pool.get(
+            pool_id, False
+        )
+        group = next(
+            (group for group in result.split_groups if pool_id in group.pool_ids),
+            None,
+        )
+        now_valid = review_after.validity_by_pool[pool_id]
+        if group is not None:
+            valid_ids = {
+                member_id
+                for member_id in group.pool_ids
+                if review_after.validity_by_pool.get(member_id, False)
+            }
+            try:
+                corrected = apply_split_group_decision(
+                    np.asarray(labels, dtype=np.int32),
+                    result.candidate_labels,
+                    group.pool_ids,
+                    group.parent_pool_id,
+                    valid_ids,
+                    merged=group.group_id
+                    in review_after.merged_split_group_ids,
+                )
+            except LabelOverlapError as error:
+                QMessageBox.warning(self, "Validity not changed", str(error))
+                return
+            group_mask = np.isin(result.candidate_labels, group.pool_ids)
+            state.selected_pool_ids = {
+                int(value)
+                for value in np.unique(corrected[group_mask])
+                if value > 0
+            }
+        else:
+            corrected = np.asarray(labels, dtype=np.int32).copy()
+            candidate_mask = result.candidate_labels == pool_id
+            if now_valid:
+                conflicts = (corrected[candidate_mask] > 0) & (
+                    corrected[candidate_mask] != pool_id
+                )
+                if np.any(conflicts):
+                    QMessageBox.warning(
+                        self,
+                        "Candidate not made valid",
+                        "A manual pool now occupies part of this candidate. Undo "
+                        "that edit or rerun segmentation first.",
+                    )
+                    return
+                corrected[candidate_mask] = pool_id
+                state.selected_pool_ids = {pool_id}
+            else:
+                corrected[candidate_mask & (corrected == pool_id)] = 0
+                state.selected_pool_ids.discard(pool_id)
+        description = (
+            f"Mark pool {pool_id} valid"
+            if now_valid
+            else f"Mark pool {pool_id} invalid"
+        )
+        self._record_correction(
+            corrected,
+            description,
+            review_after=review_after,
+        )
+
+    def _toggle_split_group(self, group_id: int) -> None:
+        state = self.current_analysis_state
+        labels = self._current_labels()
+        if (
+            state is None
+            or labels is None
+            or state.segmentation_result is None
+            or group_id not in state.split_review_group_ids
+        ):
+            return
+        result = state.segmentation_result
+        group = next(
+            (item for item in result.split_groups if item.group_id == group_id),
+            None,
+        )
+        if group is None:
+            return
+        review_after = state.pool_review_snapshot()
+        merging = group_id not in review_after.merged_split_group_ids
+        if merging:
+            review_after.merged_split_group_ids.add(group_id)
+        else:
+            review_after.merged_split_group_ids.discard(group_id)
+        valid_ids = {
+            pool_id
+            for pool_id in group.pool_ids
+            if review_after.validity_by_pool.get(pool_id, False)
+        }
+        try:
+            corrected = apply_split_group_decision(
+                np.asarray(labels, dtype=np.int32),
+                result.candidate_labels,
+                group.pool_ids,
+                group.parent_pool_id,
+                valid_ids,
+                merged=merging,
+            )
+        except LabelOverlapError as error:
+            QMessageBox.warning(self, "Split decision not changed", str(error))
+            return
+        group_mask = np.isin(result.candidate_labels, group.pool_ids)
+        state.selected_pool_ids = {
+            int(value)
+            for value in np.unique(corrected[group_mask])
+            if value > 0
+        }
+        description = (
+            f"Merge automatic split group {group_id}"
+            if merging
+            else f"Restore automatic split group {group_id}"
+        )
+        self._record_correction(
+            corrected,
+            description,
+            review_after=review_after,
+        )
+
+    def _resolve_flagged_pool(self, pool_id: int) -> None:
+        """Backward-compatible entry point for toggling candidate validity."""
+        self._toggle_pool_validity(pool_id)
 
     def _begin_correction_drawing(self, mode: str) -> None:
         state = self.current_analysis_state
@@ -4360,7 +5399,12 @@ class MainWindow(QMainWindow):
                 mask = ellipse_mask(labels.shape, geometry)
                 self._apply_drawn_pool(mask, selected, "Oval boundary")
             elif mode == "separate":
-                corrected = split_pool_with_line(labels, selected[0], geometry)
+                corrected = split_pool_with_line(
+                    labels,
+                    selected[0],
+                    geometry,
+                    next_pool_id=self._next_available_pool_id(state, labels),
+                )
                 self._record_correction(corrected, f"Separate pool {selected[0]}")
             elif mode == "hint":
                 rectangle = self._rectangle_for_hint(geometry)
@@ -4410,8 +5454,16 @@ class MainWindow(QMainWindow):
             labels.shape, tuple(state.rectangles)
         )
         replace_ids = selected if len(selected) == 1 else ()
+        new_pool_id = (
+            None if replace_ids else self._next_available_pool_id(state, labels)
+        )
         try:
-            corrected = apply_shape(labels, mask, replace_ids=replace_ids)
+            corrected = apply_shape(
+                labels,
+                mask,
+                replace_ids=replace_ids,
+                new_pool_id=new_pool_id,
+            )
         except LabelOverlapError as error:
             answer = QMessageBox.warning(
                 self,
@@ -4429,22 +5481,69 @@ class MainWindow(QMainWindow):
                 mask,
                 replace_ids=replace_ids,
                 allow_overwrite=True,
+                new_pool_id=new_pool_id,
             )
         self._record_correction(corrected, description)
 
+    @staticmethod
+    def _next_available_pool_id(
+        state: RecordingAnalysisState,
+        labels: np.ndarray[Any, Any],
+    ) -> int:
+        highest_id = int(np.max(labels)) if labels.size else 0
+        if state.segmentation_result is not None:
+            highest_id = max(
+                highest_id,
+                int(np.max(state.segmentation_result.candidate_labels)),
+            )
+        return highest_id + 1
+
     def _record_correction(
-        self, corrected: np.ndarray[Any, Any], description: str
+        self,
+        corrected: np.ndarray[Any, Any],
+        description: str,
+        *,
+        review_after: _PoolReviewSnapshot | None = None,
     ) -> None:
         state = self.current_analysis_state
         labels = self._current_labels()
         if state is None or labels is None:
             return
         corrected = np.asarray(corrected, dtype=np.int32)
-        edit = make_edit(labels, corrected, description)
-        if not len(edit.flat_indices):
+        mask_edit = make_edit(labels, corrected, description)
+        review_before = state.pool_review_snapshot()
+        if review_after is None:
+            review_after = review_before.copy()
+            changed_ids: set[int] = set()
+            if len(mask_edit.flat_indices):
+                before_flat = np.asarray(labels).ravel()[mask_edit.flat_indices]
+                after_flat = corrected.ravel()[mask_edit.flat_indices]
+                changed_ids = {
+                    int(value)
+                    for value in np.unique(np.concatenate((before_flat, after_flat)))
+                    if value > 0
+                }
+                if state.segmentation_result is not None:
+                    candidate_flat = state.segmentation_result.candidate_labels.ravel()[
+                        mask_edit.flat_indices
+                    ]
+                    changed_ids.update(
+                        int(value) for value in np.unique(candidate_flat) if value > 0
+                    )
+            related_ids = set(changed_ids)
+            if state.segmentation_result is not None:
+                for group in state.segmentation_result.split_groups:
+                    if related_ids.intersection(group.pool_ids):
+                        related_ids.update(group.pool_ids)
+                        review_after.split_review_group_ids.discard(group.group_id)
+                        review_after.merged_split_group_ids.discard(group.group_id)
+            review_after.quality_review_pool_ids.difference_update(related_ids)
+        if not len(mask_edit.flat_indices) and review_after == review_before:
             self.statusBar().showMessage("Correction made no changes")
             return
+        edit = _PoolEdit(mask_edit, review_before, review_after.copy())
         state.corrected_labels = corrected
+        state.restore_pool_review_snapshot(review_after)
         state.correction_undo.append(edit)
         state.correction_redo.clear()
         existing = {int(value) for value in np.unique(corrected) if value > 0}
@@ -4488,7 +5587,7 @@ class MainWindow(QMainWindow):
         if state is None or labels is None or not state.correction_undo:
             return
         edit = state.correction_undo.pop()
-        edit.apply(labels, undo=True)
+        state.restore_pool_review_snapshot(edit.apply(labels, undo=True))
         state.correction_redo.append(edit)
         state.selected_pool_ids.clear()
         self._invalidate_trace_cache(state, pool_identities_changed=True)
@@ -4504,7 +5603,7 @@ class MainWindow(QMainWindow):
         if state is None or labels is None or not state.correction_redo:
             return
         edit = state.correction_redo.pop()
-        edit.apply(labels)
+        state.restore_pool_review_snapshot(edit.apply(labels))
         state.correction_undo.append(edit)
         state.selected_pool_ids.clear()
         self._invalidate_trace_cache(state, pool_identities_changed=True)
@@ -4519,8 +5618,19 @@ class MainWindow(QMainWindow):
         if state is None or state.segmentation_result is None:
             return
         state.selected_pool_ids.clear()
+        result = state.segmentation_result
+        review_after = _PoolReviewSnapshot(
+            validity_by_pool={pool.pool_id: pool.accepted for pool in result.pools},
+            merged_split_group_ids=set(),
+            quality_review_pool_ids={pool.pool_id for pool in result.pools},
+            split_review_group_ids={
+                group.group_id for group in result.split_groups
+            },
+        )
         self._record_correction(
-            state.segmentation_result.labels.copy(), "Reset to automatic segmentation"
+            result.labels.copy(),
+            "Reset to automatic segmentation",
+            review_after=review_after,
         )
 
     def _invalidate_area_analysis(
@@ -5839,7 +6949,24 @@ class MainWindow(QMainWindow):
         self.go_to_peak_button.setEnabled(False)
         self.run_segmentation_button.setEnabled(False)
         self.run_segmentation_button.setText("Run automatic segmentation")
-        self.show_segmentation_checkbox.setEnabled(False)
+        for control in (
+            self.show_segmentation_checkbox,
+            self.show_pool_ids_checkbox,
+            self.show_quality_review_checkbox,
+            self.show_split_review_checkbox,
+            self.top_show_segmentation_checkbox,
+            self.top_show_pool_ids_checkbox,
+            self.top_show_quality_review_checkbox,
+            self.top_show_split_review_checkbox,
+            self.review_quality_button,
+            self.review_split_button,
+        ):
+            control.setEnabled(False)
+        self.review_quality_button.setChecked(False)
+        self.review_split_button.setChecked(False)
+        self._overlay_visibility_before_review = None
+        self.quality_review_list.clear()
+        self.split_review_list.clear()
         self.segmentation_summary_label.setText(
             "Calculate a recording peak before segmentation."
         )
@@ -5897,6 +7024,8 @@ class MainWindow(QMainWindow):
             "Complete pool segmentation and background selection before exporting."
         )
         self.canvas.clear_segmentation()
+        self.canvas.clear_reviews()
+        self.canvas.clear_pool_ids()
         self.canvas.clear_backgrounds()
 
     def _show_error(self, title: str, message: str) -> None:
